@@ -9,7 +9,6 @@ from .sport_adapters import (
 )
 
 def get_adapter(sport: str):
-    """Factory to get the right adapter instance for a sport."""
     sport = sport.lower()
     if sport == "mlb":
         return MLBAdapter()
