@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 LINEUP_STATUS_URL = "https://edgelab.julianmusichhtx.workers.dev/lineup-status"
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
 
-# Caching
+# Simple in-memory cache
 _cache: Dict[str, Any] = {}
 _cache_ttl: Dict[str, float] = {}
 
@@ -39,29 +39,45 @@ class MLBAdapter(BaseSportAdapter):
             enriched["player_name_clean"] = player_name.lower()
             enriched["is_pitcher"] = self._is_pitcher_prop(stat_display)
 
-            # Cached Lineup
+            # === Lineup Status (cached) ===
             lineup_key = f"lineup:{player_name.lower()}"
             lineup = _get_cached(lineup_key)
             if lineup is None:
                 lineup = self._fetch_lineup_status(player_name)
                 _set_cache(lineup_key, lineup or {})
+            
             if lineup:
                 enriched["lineup_status"] = lineup
                 enriched["is_confirmed"] = lineup.get("status") == "CONFIRMED"
+            else:
+                enriched["is_confirmed"] = False
 
-            # Cached Game Info
+            # === Game Context (cached) ===
             game_key = f"game:{datetime.now().strftime('%Y-%m-%d')}"
             game_info = _get_cached(game_key)
             if game_info is None:
                 game_info = self._fetch_mlb_game_info(player_name)
                 _set_cache(game_key, game_info or {})
+            
             if game_info:
                 enriched.update(game_info)
 
-            enriched["verdict"] = "PICK" if enriched.get("is_confirmed") else "SKIP"
-            enriched["reason"] = "Confirmed in lineup" if enriched.get("is_confirmed") else "Lineup not confirmed"
+            # === RELAXED SCORING (Option 1) ===
+            if enriched.get("is_confirmed"):
+                enriched["verdict"] = "PICK"
+                enriched["reason"] = "Confirmed in lineup"
+                enriched["confidence"] = 0.75
+            elif enriched.get("game_time") or enriched.get("home_team"):
+                enriched["verdict"] = "PICK"
+                enriched["reason"] = "Has game context"
+                enriched["confidence"] = 0.55
+            else:
+                enriched["verdict"] = "SKIP"
+                enriched["reason"] = "Insufficient lineup/game data"
+                enriched["confidence"] = 0.3
 
             return enriched
+
         except Exception as e:
             logger.warning(f"Enrich error for {player_name}: {e}")
             return prop
@@ -69,12 +85,11 @@ class MLBAdapter(BaseSportAdapter):
     def enrich_props(self, props: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         results = []
         for i in range(0, len(props), 400):
-            batch = props[i:i+400]
+            batch = props[i:i + 400]
             results.extend([self.enrich_prop(p) for p in batch])
         return results
 
     def get_player_stats(self, player_name: str) -> Dict[str, Any]:
-        # Placeholder - can be expanded later with Sportradar or other sources
         return {}
 
     def get_todays_games(self) -> List[Dict[str, Any]]:
