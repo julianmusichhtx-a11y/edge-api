@@ -1,6 +1,5 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import logging
-import os
 import httpx
 from datetime import datetime
 from .base_adapter import BaseSportAdapter
@@ -9,15 +8,15 @@ logger = logging.getLogger(__name__)
 
 LINEUP_STATUS_URL = "https://edgelab.julianmusichhtx.workers.dev/lineup-status"
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
-SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY")
+SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY")  # Make sure this is set
 
 
 class MLBAdapter(BaseSportAdapter):
-    """
-    Best version of MLBAdapter using httpx (no extra install needed).
-    """
+    sport_key = "mlb"
+    sport_label = "MLB"
 
     def enrich_prop(self, prop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Your existing enrichment logic from before
         try:
             enriched = prop.copy()
             player_name = prop.get("player_name", "")
@@ -27,27 +26,39 @@ class MLBAdapter(BaseSportAdapter):
             enriched["player_name_clean"] = player_name.lower().strip()
             enriched["is_pitcher"] = self._is_pitcher_prop(stat_display)
 
-            # 1. Lineup Status
             lineup = self._get_lineup_status(player_name)
             if lineup:
                 enriched["lineup_status"] = lineup
                 enriched["is_confirmed"] = lineup.get("status") == "CONFIRMED"
 
-            # 2. MLB Stats API
             game_info = self._get_mlb_game_info(player_name)
             if game_info:
                 enriched.update(game_info)
 
-            # 3. Sportradar
             sportradar_stats = self._get_sportradar_player_stats(player_name, enriched["is_pitcher"])
             if sportradar_stats:
                 enriched.update(sportradar_stats)
 
             return enriched
-
         except Exception as e:
-            logger.warning(f"MLB enrichment failed for {player_name}: {e}")
+            logger.warning(f"MLB enrich_prop failed for {player_name}: {e}")
             return None
+
+    def enrich_props(self, props: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [self.enrich_prop(p) for p in props if p]
+
+    def get_player_stats(self, player_name: str) -> Dict[str, Any]:
+        return self._get_sportradar_player_stats(player_name, False)
+
+    def get_todays_games(self) -> List[Dict[str, Any]]:
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            url = f"{MLB_SCHEDULE_URL}?sportId=1&date={today}"
+            with httpx.Client(timeout=5.0) as client:
+                res = client.get(url)
+                return res.json().get("dates", [{}])[0].get("games", [])
+        except:
+            return []
 
     def _is_pitcher_prop(self, stat_display: str) -> bool:
         keywords = ["strikeout", "pitch", "earned run", "hit allowed", "walk allowed"]
@@ -63,6 +74,7 @@ class MLBAdapter(BaseSportAdapter):
             return None
 
     def _get_mlb_game_info(self, player_name: str) -> Optional[Dict]:
+        # Same as before
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             url = f"{MLB_SCHEDULE_URL}?sportId=1&date={today}&hydrate=team,venue"
@@ -88,8 +100,8 @@ class MLBAdapter(BaseSportAdapter):
     def _get_sportradar_player_stats(self, player_name: str, is_pitcher: bool) -> Dict:
         if not SPORTRADAR_API_KEY:
             return {}
+        # Same Sportradar logic as before...
         try:
-            # Search for player
             search_url = f"https://api.sportradar.com/mlb/trial/v7/en/players/search.json?api_key={SPORTRADAR_API_KEY}&name={player_name}"
             with httpx.Client(timeout=6.0) as client:
                 search_res = client.get(search_url)
@@ -100,7 +112,6 @@ class MLBAdapter(BaseSportAdapter):
                     return {}
                 player_id = players[0].get("id")
 
-                # Get profile
                 profile_url = f"https://api.sportradar.com/mlb/trial/v7/en/players/{player_id}/profile.json?api_key={SPORTRADAR_API_KEY}"
                 profile_res = client.get(profile_url)
                 if profile_res.status_code != 200:
@@ -120,5 +131,5 @@ class MLBAdapter(BaseSportAdapter):
 
                 return stats
         except Exception as e:
-            logger.debug(f"Sportradar error for {player_name}: {e}")
+            logger.debug(f"Sportradar error: {e}")
             return {}
