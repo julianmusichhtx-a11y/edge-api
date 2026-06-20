@@ -30,9 +30,23 @@ FIFA_WC_SEASON_ID = "sr:season:101177"
 
 
 class SoccerAdapter(BaseSportAdapter):
-    sport_key = "soccer"
-    sport_label = "Soccer"
     LOOKBACK_DAYS = 14
+
+    @property
+    def sport_key(self) -> str:
+        return "soccer"
+
+    @property
+    def sport_label(self) -> str:
+        return "Soccer"
+
+    def get_player_stats(self, player_name: str):
+        """Not used — SoccerAdapter uses batch enrich_props instead."""
+        return None
+
+    def get_todays_games(self):
+        """Not used — SoccerAdapter uses season schedule instead."""
+        return []
 
     STAT_EXTRACTORS = {
         "goals":            lambda s: int(s.get("goals_scored", 0)),
