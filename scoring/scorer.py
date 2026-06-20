@@ -162,6 +162,46 @@ def classify_pick(model_prob: float, edge: float, signals: int, volatility: str)
     return verdict, tier
 
 
+def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
+    """
+    Batch-score a list of enriched prop dicts.
+
+    Calls score_prop on each prop, separates results into picks (edge >= min_edge
+    and verdict != SKIP) and passes, and returns a summary dict.
+
+    Note: min_edge is a decimal (e.g. 0.05 for 5%), while score_prop returns edge
+    as a percentage (e.g. 5.0), so the comparison uses min_edge * 100.
+
+    Returns:
+        {
+            "picks": [...],   # props meeting the edge threshold
+            "passes": [...],  # props below threshold or skipped
+            "stats_context": str,
+        }
+    """
+    picks = []
+    passes = []
+
+    for prop in props:
+        scored = score_prop(prop)
+
+        if scored is None:
+            scored = {"verdict": "SKIP", "edge": 0}
+
+        result = {**prop, **scored}
+
+        if scored.get("verdict") != "SKIP" and scored.get("edge", 0) >= min_edge * 100:
+            picks.append(result)
+        else:
+            passes.append(result)
+
+    return {
+        "picks": picks,
+        "passes": passes,
+        "stats_context": f"{len(picks)} pick(s) from {len(props)} prop(s) scored.",
+    }
+
+
 def filter_prop(prop: dict) -> dict:
     """
     Filter a prop before scoring.
