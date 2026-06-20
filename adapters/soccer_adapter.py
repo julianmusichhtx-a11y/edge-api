@@ -109,7 +109,6 @@ class SoccerAdapter(BaseSportAdapter):
     async def _load_game_logs(self):
         if self._loaded:
             return
-        self._loaded = True
 
         # Fetch the full season schedule to find completed games
         data = await self._fetch(
@@ -179,6 +178,8 @@ class SoccerAdapter(BaseSportAdapter):
                     self._player_game_log[norm].append(stats)
 
         print(f"[Soccer] Built game logs for {len(self._player_game_log)} players")
+        if self._player_game_log:  # Only mark loaded if we actually got data
+            self._loaded = True
 
     def _resolve_stat_key(self, stat_display: str) -> Optional[str]:
         """Map Underdog stat display strings to our canonical keys."""
@@ -221,11 +222,17 @@ class SoccerAdapter(BaseSportAdapter):
             game_log = self._player_game_log.get(norm)
 
             if not game_log:
-                # Try matching on last name only (Underdog sometimes uses full names,
-                # Sportradar uses "Last, First")
+                # Try reversed order: "Raul Jimenez" → check "jimenez raul"
+                parts = norm.split()
+                if len(parts) >= 2:
+                    reversed_norm = f"{parts[-1]} {' '.join(parts[:-1])}"
+                    game_log = self._player_game_log.get(reversed_norm)
+
+            if not game_log:
+                # Last-name fuzzy fallback
                 last_name = norm.split()[-1] if norm else ""
                 for key, log in self._player_game_log.items():
-                    if last_name and last_name in key:
+                    if last_name and last_name in key.split():
                         game_log = log
                         break
 
