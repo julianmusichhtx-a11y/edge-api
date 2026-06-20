@@ -133,24 +133,35 @@ def score_prop(prop: dict) -> dict | None:
 
 
 def classify_pick(model_prob: float, edge: float, signals: int, volatility: str) -> tuple[str, str]:
-    """Classify a pick into verdict and tier."""
+    """
+    Classify a pick into verdict and tier.
+
+    Calibration notes (June 2026 tuning):
+    - Real profitable edges in player props live in 52–58% true hit rate range
+    - 30%+ edge values are being seen routinely, which means thresholds must be
+      tighter to keep "STRONG PLAY" and "A-tier" meaningful and rare
+    - STRONG PLAY should require model prob >= 0.65 AND edge >= 0.15 (was 0.10)
+    - A-tier requires model prob >= 0.63 (was 0.65) but signals >= 3 AND low/medium vol
+    - Added edge floor of 0.08 for A-tier (was no floor beyond 0.05 for PLAY)
+    - Pass tier floor raised from 0.53 to 0.54 to prune marginal C picks
+    """
     if edge <= 0:
         return "SKIP", "Pass"
 
-    # Tier classification
-    if model_prob >= 0.65 and signals >= 3 and volatility in ("low", "medium"):
+    # Tier classification — tightened to keep A-tier meaningful
+    if model_prob >= 0.63 and signals >= 3 and edge >= 0.08 and volatility in ("low", "medium"):
         tier = "A"
-    elif model_prob >= 0.58 and signals >= 2:
+    elif model_prob >= 0.58 and signals >= 2 and edge >= 0.04:
         tier = "B"
-    elif model_prob >= 0.53:
+    elif model_prob >= 0.54:
         tier = "C"
     else:
         tier = "Pass"
 
-    # Verdict classification
+    # Verdict classification — STRONG PLAY now requires higher edge floor
     if tier == "Pass" or edge < 0.02:
         verdict = "SKIP"
-    elif tier == "A" and edge >= 0.10:
+    elif tier == "A" and edge >= 0.15:
         verdict = "STRONG PLAY"
     elif tier in ("A", "B") and edge >= 0.05:
         verdict = "PLAY"
