@@ -1,6 +1,12 @@
-from .base_adapter import BaseAdapter
+from .base_adapter import BaseSportAdapter as BaseAdapter
 from .mlb_adapter import MLBAdapter
-from .sport_adapters import NBAAdapter, WNBAAdapter, NFLAdapter, NHLAdapter, SoccerAdapter
+from .sport_adapters import (
+    NBAAdapter,
+    WNBAAdapter,
+    NFLAdapter,
+    NHLAdapter,
+    SoccerAdapter,
+)
 
 def get_adapter(sport: str):
     """Factory to get the right adapter instance for a sport."""
@@ -18,4 +24,4 @@ def get_adapter(sport: str):
     elif sport == "soccer":
         return SoccerAdapter()
     else:
-        return None  # Or a GenericAdapter fallback
+        return None
