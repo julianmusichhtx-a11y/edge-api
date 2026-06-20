@@ -74,21 +74,6 @@ class NHLAdapter(SportradarAdapter):
     }
 
 
-class SoccerAdapter(SportradarAdapter):
-    sport_key = "soccer"
-    sport_label = "Soccer"
-    LOOKBACK_DAYS = 14  # Soccer has fewer games per week
-
-    STAT_EXTRACTORS = {
-        "goals":           lambda s: int(s.get("goals_scored", s.get("goals", 0))),
-        "assists":         lambda s: int(s.get("assists", 0)),
-        "shots":           lambda s: int(s.get("shots_total", s.get("shots", 0))),
-        "shots_on_target": lambda s: int(s.get("shots_on_target", s.get("shots_on_goal", 0))),
-        "tackles":         lambda s: int(s.get("tackles", 0)),
-        "passes":          lambda s: int(s.get("passes_total", s.get("passes", 0))),
-    }
-
-
 class MMAAdapter(SportradarAdapter):
     sport_key = "mma"
     sport_label = "MMA"

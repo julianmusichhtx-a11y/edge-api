@@ -335,7 +335,10 @@ def filter_prop(prop: dict) -> dict:
     # Need minimum game data
     if stats:
         last5 = stats.get("last5", [])
-        if len(last5) < 3 and stats.get("seasonAvg") is None:
-            return {"status": "hard_reject", "reason": f"Insufficient player data (need 3+ recent games, found {len(last5)})"}
+        # Soccer/tournament players may have only 1-2 games — allow if seasonAvg present
+        # or if we have at least 1 game log entry (tournament context)
+        min_games = 1 if prop.get("_sport_key") == "soccer" else 3
+        if len(last5) < min_games and stats.get("seasonAvg") is None:
+            return {"status": "hard_reject", "reason": f"Insufficient player data (need {min_games}+ recent games, found {len(last5)})"}
 
     return {"status": "pass", "reason": ""}
