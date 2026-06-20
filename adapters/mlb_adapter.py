@@ -1,3 +1,4 @@
+import os
 from typing import Dict, Any, List, Optional
 import logging
 import httpx
@@ -8,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 LINEUP_STATUS_URL = "https://edgelab.julianmusichhtx.workers.dev/lineup-status"
 MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
-SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY")  # Make sure this is set
+SPORTRADAR_API_KEY = os.getenv("SPORTRADAR_API_KEY")
 
 
 class MLBAdapter(BaseSportAdapter):
@@ -16,7 +17,6 @@ class MLBAdapter(BaseSportAdapter):
     sport_label = "MLB"
 
     def enrich_prop(self, prop: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        # Your existing enrichment logic from before
         try:
             enriched = prop.copy()
             player_name = prop.get("player_name", "")
@@ -74,7 +74,6 @@ class MLBAdapter(BaseSportAdapter):
             return None
 
     def _get_mlb_game_info(self, player_name: str) -> Optional[Dict]:
-        # Same as before
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             url = f"{MLB_SCHEDULE_URL}?sportId=1&date={today}&hydrate=team,venue"
@@ -100,7 +99,6 @@ class MLBAdapter(BaseSportAdapter):
     def _get_sportradar_player_stats(self, player_name: str, is_pitcher: bool) -> Dict:
         if not SPORTRADAR_API_KEY:
             return {}
-        # Same Sportradar logic as before...
         try:
             search_url = f"https://api.sportradar.com/mlb/trial/v7/en/players/search.json?api_key={SPORTRADAR_API_KEY}&name={player_name}"
             with httpx.Client(timeout=6.0) as client:
@@ -131,5 +129,5 @@ class MLBAdapter(BaseSportAdapter):
 
                 return stats
         except Exception as e:
-            logger.debug(f"Sportradar error: {e}")
+            logger.debug(f"Sportradar error for {player_name}: {e}")
             return {}
