@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import traceback
 import logging
+import inspect
 
 from adapters import get_adapter
 from scoring.scorer import score_props
@@ -55,26 +56,23 @@ async def predict(request: PredictRequest):
         if not adapter:
             raise HTTPException(status_code=400, detail=f"Unsupported sport: {request.sport}")
 
-        enriched_props = []
+        raw_props = [p.dict() for p in request.props]
         enrichment_errors = []
 
-        for prop in request.props:
-            try:
-                # Try to use enrich_prop if it exists, otherwise use raw data
-                if hasattr(adapter, "enrich_prop"):
-                    enriched = adapter.enrich_prop(prop.dict())
-                else:
-                    enriched = prop.dict()
-
-                if enriched:
-                    enriched_props.append(enriched)
-
-            except Exception as e:
-                enrichment_errors.append({
-                    "player": prop.player_name,
-                    "stat": prop.stat_display,
-                    "error": str(e)
-                })
+        try:
+            # Sportradar-backed adapters (WNBA/NBA/NFL/NHL/Soccer/MMA) define
+            # enrich_props as async — it batches roster/gamelog fetches once
+            # for the whole slate instead of refetching per prop.
+            # MLBAdapter defines it as a plain sync method.
+            if inspect.iscoroutinefunction(adapter.enrich_props):
+                enriched_props = await adapter.enrich_props(raw_props)
+            else:
+                enriched_props = adapter.enrich_props(raw_props)
+        except Exception as e:
+            logger.error(f"Batch enrichment failed for {request.sport}: {e}")
+            logger.error(traceback.format_exc())
+            enrichment_errors.append({"error": f"Batch enrichment failed: {e}"})
+            enriched_props = raw_props  # fall back to unenriched props rather than failing the whole request
 
         if not enriched_props:
             return {
