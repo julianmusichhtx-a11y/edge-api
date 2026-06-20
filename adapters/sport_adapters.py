@@ -92,7 +92,7 @@ ADAPTER_REGISTRY = {
     "nba": NBAAdapter,
     "nfl": NFLAdapter,
     "nhl": NHLAdapter,
-    "soccer": SoccerAdapter,
+    "soccer": None,    # SoccerAdapter is in soccer_adapter.py (FIFA WC 2026 build)
     "mma": MMAAdapter,
 }
 
