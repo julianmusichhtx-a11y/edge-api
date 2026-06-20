@@ -74,25 +74,34 @@ class SoccerAdapter(BaseSportAdapter):
         return f"{SOCCER_BASE}/{path}?api_key={SPORTRADAR_API_KEY}"
 
     async def _fetch(self, path: str, cache_type: str = None, cache_key: str = None):
+        import asyncio
         if cache_type and cache_key:
             cached = cache.get(cache_type, cache_key)
             if cached is not None:
                 return cached
 
-        await rate_limiter.acquire("sportradar", min_interval=1.1, daily_limit=1000)
-        try:
-            url = self._url(path)
-            resp = await self._client.get(url)
-            if resp.status_code != 200:
-                print(f"[Soccer] HTTP {resp.status_code} for {path}")
-                return None
-            data = resp.json()
-            if cache_type and cache_key:
-                cache.put(cache_type, cache_key, data)
-            return data
-        except Exception as e:
-            print(f"[Soccer] fetch failed {path}: {e}")
-            return None
+        for attempt in range(3):
+            await rate_limiter.acquire("sportradar", min_interval=1.2, daily_limit=1000)
+            try:
+                url = self._url(path)
+                resp = await self._client.get(url)
+                if resp.status_code == 429:
+                    wait = 2.0 * (attempt + 1)
+                    print(f"[Soccer] 429 rate limit on attempt {attempt+1}, waiting {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    print(f"[Soccer] HTTP {resp.status_code} for {path}")
+                    return None
+                data = resp.json()
+                if cache_type and cache_key:
+                    cache.put(cache_type, cache_key, data)
+                return data
+            except Exception as e:
+                print(f"[Soccer] fetch failed {path}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
+        return None
 
     @staticmethod
     def _normalize_name(raw: str) -> str:
