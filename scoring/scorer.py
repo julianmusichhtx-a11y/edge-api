@@ -155,18 +155,10 @@ def score_prop(prop: dict) -> dict | None:
         smoothed_higher = recent_higher * 0.55 + (0.5 + avg_signal_higher) * 0.45
         smoothed_lower = recent_lower * 0.55 + (0.5 + avg_signal_lower) * 0.45
 
-    # ── Signal-scaled ceiling ──
-    # A-tier picks (signals=5) max out at 80%; B-tier (signals=2) max at 70%.
-    # This prevents any pick from claiming 85%+ model probability.
-    raw_signals_estimate = 0
-    if last5 and higher_l5 >= 0.6: raw_signals_estimate += 1
-    if last10 and higher_l10 >= 0.6: raw_signals_estimate += 1
-    if use_lambda and season_avg > line * 1.1: raw_signals_estimate += 1
-    signal_ceiling = {0: 0.65, 1: 0.67, 2: 0.70, 3: 0.74, 4: 0.77, 5: 0.80}.get(
-        min(raw_signals_estimate + (2 if (use_lambda and season_avg > line * 1.1 and (season_avg - line) / max(line, 0.5) > 0.3) else 0), 5), 0.72
-    )
-    smoothed_higher = max(0.20, min(signal_ceiling, smoothed_higher))
-    smoothed_lower = max(0.20, min(signal_ceiling, smoothed_lower))
+    # ── Pre-selection ceiling (loose) ──
+    # Cap at 0.80 before side selection; direction-aware ceiling applied below.
+    smoothed_higher = max(0.20, min(0.80, smoothed_higher))
+    smoothed_lower = max(0.20, min(0.80, smoothed_lower))
 
     # ── Market probabilities from odds ──
     higher_odds = prop.get("higher_american_odds") or prop.get("american_odds")
@@ -208,6 +200,25 @@ def score_prop(prop: dict) -> dict | None:
         market_prob = mkt_l
         edge = lower_edge
 
+    # ── Direction-aware signal ceiling ──
+    # Now that we know which side we picked, compute how many signals actually
+    # support that direction and tighten the model_prob ceiling accordingly.
+    raw_signals_estimate = 0
+    if selected_side == "Higher":
+        if last5 and higher_l5 >= 0.6: raw_signals_estimate += 1
+        if last10 and higher_l10 >= 0.6: raw_signals_estimate += 1
+        if use_lambda and season_avg > line * 1.1: raw_signals_estimate += 1
+        big_avg_gap = use_lambda and season_avg > line * 1.1 and (season_avg - line) / max(line, 0.5) > 0.3
+    else:
+        if last5 and lower_l5 >= 0.6: raw_signals_estimate += 1
+        if last10 and lower_l10 >= 0.6: raw_signals_estimate += 1
+        if use_lambda and season_avg < line * 0.9: raw_signals_estimate += 1
+        big_avg_gap = use_lambda and season_avg < line * 0.9 and (line - season_avg) / max(line, 0.5) > 0.3
+    signal_ceiling = {0: 0.65, 1: 0.67, 2: 0.70, 3: 0.74, 4: 0.77, 5: 0.80}.get(
+        min(raw_signals_estimate + (2 if big_avg_gap else 0), 5), 0.72
+    )
+    model_prob = max(0.20, min(signal_ceiling, model_prob))
+
     # ── Suppress no-odds noise picks ──
     # When the market defaults to exactly 50% (no real odds data), the "edge"
     # is entirely model-driven with no market anchor. For soccer props with
@@ -236,10 +247,19 @@ def score_prop(prop: dict) -> dict | None:
     volatility = classify_volatility(stat_key or "", line)
 
     # ── Count signals ──
+    # Signals must align with the selected side. A Lower pick on a player who
+    # rarely scores doesn't get credit for "high Lower hit rate" — that's not
+    # edge, it's just a low-output player on a low line. We require the season
+    # average to actually support the direction too.
     signals = 0
-    if last5 and higher_l5 >= 0.6: signals += 1
-    if last10 and higher_l10 >= 0.6: signals += 1
-    if use_lambda and season_avg > line * 1.1: signals += 1
+    if selected_side == "Higher":
+        if last5 and higher_l5 >= 0.6: signals += 1
+        if last10 and higher_l10 >= 0.6: signals += 1
+        if use_lambda and season_avg > line * 1.1: signals += 1
+    else:  # Lower
+        if last5 and lower_l5 >= 0.6: signals += 1
+        if last10 and lower_l10 >= 0.6: signals += 1
+        if use_lambda and season_avg < line * 0.9: signals += 1
     if edge > 0.05: signals += 1
     if edge > 0.15: signals += 1
 
@@ -272,16 +292,23 @@ def classify_pick(model_prob: float, edge: float, signals: int, volatility: str)
 
     Thresholds calibrated for the Poisson-anchored model where 54-65% is
     a realistic well-supported pick and 70%+ is genuinely high-confidence.
+
+    Signal requirements (direction-aware counting):
+      signals 1-2 = only edge signals fired (no game-log or avg support) → C/Pass
+      signals 3   = at least one game-log or avg signal supports the direction → B eligible
+      signals 4-5 = strong multi-signal agreement → A eligible
     """
     if edge <= 0:
         return "SKIP", "Pass"
 
     # Tier classification
-    if model_prob >= 0.63 and signals >= 3 and edge >= 0.08 and volatility in ("low", "medium"):
+    # Require signals >= 3 for Tier B now — this means at least one of L5, L10, or
+    # season_avg must genuinely support the direction (not just edge arithmetic).
+    if model_prob >= 0.63 and signals >= 4 and edge >= 0.08 and volatility in ("low", "medium"):
         tier = "A"
-    elif model_prob >= 0.58 and signals >= 2 and edge >= 0.04:
+    elif model_prob >= 0.58 and signals >= 3 and edge >= 0.04:
         tier = "B"
-    elif model_prob >= 0.54:
+    elif model_prob >= 0.54 and signals >= 3:
         tier = "C"
     else:
         tier = "Pass"
