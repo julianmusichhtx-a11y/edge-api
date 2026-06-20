@@ -119,9 +119,23 @@ PROP_STAT_MAP = {
     "saves": "saves", "power play points": "pp_points",
     # Soccer
     "shots": "shots", "shots on target": "shots_on_target",
+    "shots on goal": "shots_on_target",
     "tackles": "tackles", "passes": "passes",
+    "soccer goals": "goals", "goal scored": "goals",
+    "soccer assists": "assists",
     # MMA
     "total rounds": "total_rounds", "significant strikes": "sig_strikes",
     # Tennis
     "aces": "aces", "double faults": "double_faults", "games won": "games_won",
+    # Esports — CS2 / Valorant / LoL / Dota 2 / Rocket League / CoD
+    "kills": "kills", "deaths": "deaths",
+    "headshots": "headshots",
+    "maps played": "maps_played", "maps": "maps_played",
+    "adr": "adr", "avg damage per round": "adr",
+    "rating": "rating", "hltv rating": "rating",
+    "eliminations": "eliminations",
+    # Rocket League esports
+    "rl goals": "goals", "rl saves": "saves", "rl score": "score",
+    # Combo / alias props
+    "kills + assists": "kills_assists",
 }

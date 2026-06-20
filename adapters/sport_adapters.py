@@ -110,3 +110,43 @@ ADAPTER_REGISTRY = {
     "soccer": SoccerAdapter,
     "mma": MMAAdapter,
 }
+
+
+class EsportsAdapter:
+    """
+    Passthrough adapter for esports (CS2, LoL, Valorant, Dota 2, Rocket League, CoD).
+    No external enrichment — esports game logs are not available via Sportradar trial.
+    Props are scored math-only using market-implied probability from the line odds.
+    The scorer will handle these gracefully when game_logs is empty.
+    """
+    sport_key = "esports"
+    sport_label = "Esports"
+
+    # Stat extractors are defined for the scorer's reference even if logs are empty.
+    # If we ever add an esports data source, these are the canonical keys.
+    STAT_EXTRACTORS = {
+        "kills":         lambda s: float(s.get("kills", 0)),
+        "deaths":        lambda s: float(s.get("deaths", 0)),
+        "assists":       lambda s: float(s.get("assists", 0)),
+        "headshots":     lambda s: float(s.get("headshots", 0)),
+        "maps_played":   lambda s: float(s.get("maps_played", s.get("maps", 0))),
+        "adr":           lambda s: float(s.get("adr", s.get("avg_damage_round", 0))),
+        "rating":        lambda s: float(s.get("rating", 0)),
+        "goals":         lambda s: float(s.get("goals", 0)),    # Rocket League
+        "saves":         lambda s: float(s.get("saves", 0)),    # Rocket League
+        "score":         lambda s: float(s.get("score", 0)),    # Rocket League
+        "eliminations":  lambda s: float(s.get("eliminations", s.get("kills", 0))),  # CoD
+        "kills_assists": lambda s: float(s.get("kills", 0)) + float(s.get("assists", 0)),
+    }
+
+    def enrich_props(self, props: list) -> list:
+        """
+        No enrichment — mark each prop so the scorer knows logs are unavailable.
+        Math-only scoring will use market odds as the probability anchor.
+        """
+        for p in props:
+            p.setdefault("game_logs", [])
+            p.setdefault("season_avg", None)
+            p["_enrichment_source"] = "none"
+            p["_sport_key"] = "esports"
+        return props

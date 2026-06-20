@@ -6,6 +6,8 @@ from .sport_adapters import (
     NFLAdapter,
     NHLAdapter,
     SoccerAdapter,
+    MMAAdapter,
+    EsportsAdapter,
 )
 
 def get_adapter(sport: str):
@@ -22,5 +24,10 @@ def get_adapter(sport: str):
         return NHLAdapter()
     elif sport == "soccer":
         return SoccerAdapter()
+    elif sport == "mma":
+        return MMAAdapter()
+    elif sport in ("esports", "cs2", "lol", "league of legends", "valorant",
+                   "dota 2", "dota2", "rocket league", "call of duty", "cod"):
+        return EsportsAdapter()
     else:
         return None

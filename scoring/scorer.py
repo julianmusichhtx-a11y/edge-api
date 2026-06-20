@@ -66,7 +66,39 @@ def score_prop(prop: dict) -> dict | None:
     """
     stats = prop.get("_playerStats")
     if not stats:
-        return None
+        # Esports / no-enrichment path: score purely from market odds
+        sport_key = prop.get("_sport_key", "")
+        is_esports = (sport_key == "esports" or prop.get("_enrichment_source") == "none")
+        if not is_esports:
+            return None
+
+        # Use market-implied probability as model probability (no independent edge signal)
+        higher_odds = prop.get("higher_american_odds")
+        lower_odds = prop.get("lower_american_odds")
+        market_higher = american_to_implied(higher_odds) if higher_odds else 0.52
+        market_lower = american_to_implied(lower_odds) if lower_odds else 0.48
+
+        # No game log data → model prob = market prob (zero edge by default)
+        # Only flag as a pick if the market is significantly skewed (>60% one side)
+        model_prob = market_higher
+        market_prob = market_higher
+        edge = 0.0  # No alpha without data
+        selected_side = "HIGHER" if market_higher > market_lower else "LOWER"
+
+        return {
+            "modelProb": round(model_prob * 100, 1),
+            "marketProb": round(market_prob * 100, 1),
+            "edge": round(edge * 100, 1),
+            "verdict": "LEAN" if market_higher > 0.60 or market_lower > 0.60 else "SKIP",
+            "tier": "C" if market_higher > 0.60 or market_lower > 0.60 else "Pass",
+            "volatility": "high",
+            "signals": 0,
+            "selectedSide": selected_side,
+            "seasonAvg": None,
+            "_mathOnly": True,
+            "_esports": True,
+        }
+
 
     season_avg = stats.get("seasonAvg")
     last5 = stats.get("last5", [])
@@ -285,6 +317,11 @@ def filter_prop(prop: dict) -> dict:
     """
     stats = prop.get("_playerStats")
     line = float(prop.get("line", 0))
+
+    # Esports props: no game log data available — use market-implied scoring only
+    sport_key = prop.get("_sport_key", "")
+    if sport_key == "esports" or prop.get("_enrichment_source") == "none":
+        return {"status": "pass", "reason": "esports_math_only"}
 
     # Fantasy props not supported
     stat_display = prop.get("stat_display", prop.get("stat_type", "")).lower()
