@@ -117,6 +117,21 @@ async def predict(request: PredictRequest):
         )
 
 
+@app.get("/soccer-debug")
+async def soccer_debug():
+    """Show what player names the SoccerAdapter has in its game log."""
+    from adapters.soccer_adapter import SoccerAdapter
+    adapter = SoccerAdapter()
+    await adapter._load_game_logs()
+    names = sorted(adapter._player_game_log.keys())
+    jimenez = [n for n in names if "jimenez" in n or "raul" in n]
+    return {
+        "total_players": len(names),
+        "jimenez_matches": jimenez,
+        "sample_names": names[:20],
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
