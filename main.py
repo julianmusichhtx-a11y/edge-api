@@ -1,166 +1,282 @@
 """
-Edge API - Predictive Player Prop Analysis Service
-Replaces browser-side scoring/enrichment in Base44 app.
-POST /analyze accepts props from any sport and returns scored, enriched picks.
+Underdog Edge AI — Prediction API
+Replaces the enrichment + scoring layer from generateAnalysis.js.
+
+One endpoint: POST /analyze
+Takes props + sport → returns scored picks with player stats.
 """
-
-import os
-import logging
-from datetime import datetime
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+import time
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 
-from config import settings
-from adapters import get_adapter
-from scoring.scorer import score_props
-from cache.cache_manager import cache
-from utils.odds_math import american_to_implied_prob
-
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from adapters.mlb_adapter import MLBAdapter
+from adapters.sport_adapters import (
+    WNBAAdapter, NBAAdapter, NFLAdapter, NHLAdapter,
+    SoccerAdapter, MMAAdapter,
+)
+from scoring.scorer import score_prop, filter_prop
+from utils.rate_limiter import rate_limiter
+from cache import cache_manager as cache
 
 app = FastAPI(
-    title="Edge API - Sports Prop Predictor",
-    description="Multi-sport predictive analysis for DFS props (PrizePicks, Underdog, etc.)",
-    version="0.1.0"
+    title="Underdog Edge AI — Prediction API",
+    description="Sport-agnostic prop scoring and player stats enrichment",
+    version="1.0.0",
 )
 
-# Add CORS middleware so Base44 preview/sandbox can call it directly during development
+# Allow requests from your Base44 app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://preview--edgelabai.base44.app",
-        "https://*.base44.app",
-        "https://*.base44-preview.app",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "*"  # Allow all during development - tighten in production
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],  # Restrict to your domain in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ─── Adapter Registry ───────────────────────────────────────────────────────
+# Each sport has its own adapter instance (stateful — caches rosters/game logs)
+ADAPTERS = {
+    "mlb":    MLBAdapter(),
+    "wnba":  WNBAAdapter(),
+    "nba":   NBAAdapter(),
+    "nfl":   NFLAdapter(),
+    "nhl":   NHLAdapter(),
+    "soccer": SoccerAdapter(),
+    "mma":   MMAAdapter(),
+}
+
+
+# ─── Request/Response Models ────────────────────────────────────────────────
 class PropInput(BaseModel):
-    player: str = Field(..., description="Player full name")
-    stat: str = Field(..., description="Stat type e.g. Points, Rebounds, Strikeouts")
-    line: float = Field(..., description="The prop line")
-    sport: str = Field(..., description="nba, mlb, wnba, nfl, nhl, etc.")
-    platform: Optional[str] = Field("PrizePicks", description="PrizePicks or Underdog Fantasy")
-    team: Optional[str] = None
-    opponent: Optional[str] = None
-    game_time: Optional[str] = None  # ISO or whatever
-    # Any extra context from frontend
-    extra: Optional[Dict[str, Any]] = None
+    player_name: str
+    stat_display: str
+    line: float
+    higher_american_odds: Optional[int] = None
+    lower_american_odds: Optional[int] = None
+    player_team: Optional[str] = ""
+    home_team: Optional[str] = ""
+    away_team: Optional[str] = ""
+    source: Optional[str] = "underdog"
+    category: Optional[str] = ""
+
 
 class AnalyzeRequest(BaseModel):
-    props: List[PropInput]
-    platform: str = "PrizePicks"
-    persona: Optional[str] = "hybrid"  # for future context
-    min_edge: float = 0.05  # 5% default
+    sport: str                          # "mlb", "wnba", "nba", "nfl", etc.
+    props: list[PropInput]              # Raw props from Apify/ParlayAPI
+    platform: Optional[str] = "underdog"
+
 
 class ScoredPick(BaseModel):
-    player: str
-    stat: str
+    player_name: str
+    stat_display: str
     line: float
-    sport: str
-    model_prob: float  # Our predicted probability of hitting Over
-    market_prob: float  # Implied from line odds (assume -110 default if not provided)
+    selectedSide: str
+    modelProb: float
+    marketProb: float
     edge: float
-    verdict: str  # PLAY, LEAN, PASS
-    tier: str  # A/B/C or High/Med/Low
-    player_stats: Dict[str, Any]  # Enriched stats from adapter
-    key_factors: List[str]
-    analysis_context: str  # Text blob for the AI narrative generator
-    confidence: float  # 0-1
+    verdict: str
+    tier: str
+    volatility: str
+    signals: int
+    hitRates: dict
+    seasonAvg: Optional[float] = None
+    higher_american_odds: Optional[int] = None
+    lower_american_odds: Optional[int] = None
+    home_team: Optional[str] = ""
+    away_team: Optional[str] = ""
+
 
 class AnalyzeResponse(BaseModel):
-    picks: List[ScoredPick]
-    summary: Dict[str, Any]
-    cached_hits: int
-    api_calls_made: int
-    processing_time_ms: int
+    sport: str
+    platform: str
+    picks: list[ScoredPick]
+    passes: list[dict]
+    stats_context: str                  # Text block for AI narrative
+    summary: dict
+    elapsed_ms: int
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "timestamp": datetime.utcnow().isoformat(),
-        "supported_sports": list(settings.SPORT_ADAPTERS.keys()),
-        "version": "0.1.0"
-    }
 
+# ─── Main Endpoint ──────────────────────────────────────────────────────────
 @app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks):
-    start = datetime.utcnow()
-    logger.info(f"Received analyze request for {len(request.props)} props on {request.platform}")
+async def analyze(req: AnalyzeRequest):
+    """
+    Score and enrich player props for any supported sport.
 
-    enriched_props = []
-    api_calls = 0
-    cached = 0
-    enriched_count = 0
+    1. Fetches player stats (game logs, season averages) via sport adapter
+    2. Scores each prop (model probability, market probability, edge)
+    3. Returns picks (actionable) and passes (filtered out)
+    """
+    start = time.time()
+    sport = req.sport.lower().strip()
 
-    for prop in request.props:
-        adapter = get_adapter(prop.sport.lower())
-        player_stats = {"note": "No adapter - using generic recent form"}
+    adapter = ADAPTERS.get(sport)
+    if not adapter:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported sport: {sport}. Supported: {list(ADAPTERS.keys())}"
+        )
 
-        if adapter:
-            try:
-                player_stats, calls = await adapter.get_player_stats(
-                    player_name=prop.player,
-                    stat_type=prop.stat,
-                    opponent=prop.opponent,
-                    game_date=prop.game_time
-                )
-                api_calls += calls
-                if calls == 0:
-                    cached += 1
-                # Count as enriched if we got real-looking data (not just stub note)
-                if "source" in player_stats or "season_avg" in player_stats:
-                    enriched_count += 1
-            except Exception as e:
-                logger.error(f"Adapter error for {prop.player} ({prop.sport} {prop.stat}): {e}")
-                player_stats = {"error": str(e), "note": "Stats fetch failed - using conservative defaults"}
+    # Convert Pydantic models to dicts for the adapter
+    props = [p.model_dump() for p in req.props]
 
-        enriched_props.append({
-            **prop.model_dump(),
-            "player_stats": player_stats
-        })
+    # Step 1: Enrich props with player stats
+    try:
+        props = await adapter.enrich_props(props)
+    except Exception as e:
+        print(f"[{sport.upper()}] Enrichment error: {e}")
+        # Continue with whatever we have — partial data is better than none
 
-    # Score all props
-    scored = score_props(
-        enriched_props,
-        platform=request.platform,
-        min_edge=request.min_edge,
-        persona=request.persona or "hybrid"
-    )
+    # Step 2: Filter and score
+    picks = []
+    passes = []
+    stats_enriched = 0
 
-    processing_time = int((datetime.utcnow() - start).total_seconds() * 1000)
+    for prop in props:
+        # Filter first
+        filter_result = filter_prop(prop)
+        if filter_result["status"] == "hard_reject":
+            passes.append({
+                "player_name": prop.get("player_name", ""),
+                "stat_display": prop.get("stat_display", ""),
+                "line": prop.get("line"),
+                "reason": filter_result["reason"],
+            })
+            continue
 
-    # Background: log usage for future quota monitoring
-    background_tasks.add_task(log_usage, len(request.props), api_calls, cached)
+        # Score
+        scoring = score_prop(prop)
+        if not scoring:
+            passes.append({
+                "player_name": prop.get("player_name", ""),
+                "stat_display": prop.get("stat_display", ""),
+                "line": prop.get("line"),
+                "reason": "Insufficient data for scoring",
+            })
+            continue
+
+        stats_enriched += 1
+
+        # Negative edge → pass
+        if scoring["edge"] <= 0:
+            passes.append({
+                "player_name": prop.get("player_name", ""),
+                "stat_display": prop.get("stat_display", ""),
+                "line": prop.get("line"),
+                "reason": f"Negative edge ({scoring['edge']:.1f}%)",
+            })
+            continue
+
+        # Skip verdict → pass
+        if scoring["verdict"] == "SKIP":
+            passes.append({
+                "player_name": prop.get("player_name", ""),
+                "stat_display": prop.get("stat_display", ""),
+                "line": prop.get("line"),
+                "reason": f"Below threshold (edge: {scoring['edge']:.1f}%, tier: {scoring['tier']})",
+            })
+            continue
+
+        picks.append(ScoredPick(
+            player_name=prop.get("player_name", ""),
+            stat_display=prop.get("stat_display", ""),
+            line=float(prop.get("line", 0)),
+            home_team=prop.get("home_team", ""),
+            away_team=prop.get("away_team", ""),
+            higher_american_odds=prop.get("higher_american_odds"),
+            lower_american_odds=prop.get("lower_american_odds"),
+            **scoring,
+        ))
+
+    # Sort picks by edge descending
+    picks.sort(key=lambda p: p.edge, reverse=True)
+
+    # Build stats context block for AI narrative
+    stats_context = _build_stats_context(picks, sport)
+
+    elapsed = int((time.time() - start) * 1000)
 
     return AnalyzeResponse(
-        picks=scored,
+        sport=sport.upper(),
+        platform=req.platform or "underdog",
+        picks=picks,
+        passes=passes,
+        stats_context=stats_context,
         summary={
-            "total_props": len(request.props),
-            "enriched": enriched_count,
-            "playable": len([p for p in scored if p.verdict == "PLAY"]),
-            "avg_edge": round(sum(p.edge for p in scored) / len(scored), 4) if scored else 0,
-            "sports_covered": list(set(p.sport for p in request.props))
+            "total_props": len(props),
+            "enriched": stats_enriched,
+            "actionable_picks": len(picks),
+            "passes": len(passes),
+            "verdicts": _count_verdicts(picks),
+            "tiers": _count_tiers(picks),
         },
-        cached_hits=cached,
-        api_calls_made=api_calls,
-        processing_time_ms=processing_time
+        elapsed_ms=elapsed,
     )
 
-def log_usage(props_count: int, api_calls: int, cached: int):
-    logger.info(f"Usage: {props_count} props | {api_calls} API calls | {cached} from cache")
 
+# ─── Utility Endpoints ─────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok", "sports": list(ADAPTERS.keys())}
+
+
+@app.get("/quota")
+async def quota():
+    """Check current API usage against limits."""
+    return {
+        "usage": rate_limiter.get_usage(),
+        "cache": cache.stats(),
+    }
+
+
+@app.get("/schedule/{sport}")
+async def schedule(sport: str):
+    """Get today's games for a sport."""
+    adapter = ADAPTERS.get(sport.lower())
+    if not adapter:
+        raise HTTPException(status_code=400, detail=f"Unsupported sport: {sport}")
+    games = await adapter.get_todays_games()
+    return {"sport": sport, "games": [g.__dict__ for g in games]}
+
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def _build_stats_context(picks: list[ScoredPick], sport: str) -> str:
+    """Build a text block summarizing player stats for AI narrative generation."""
+    if not picks:
+        return ""
+
+    lines = []
+    for p in picks[:15]:
+        line = (
+            f"PICK: {p.player_name} — {p.selectedSide} {p.stat_display} {p.line} | "
+            f"Verdict: {p.verdict} | Tier: {p.tier} | Vol: {p.volatility} | "
+            f"Signals: {p.signals} | Model: {p.modelProb}% | Market: {p.marketProb}% | "
+            f"Edge: {'+' if p.edge >= 0 else ''}{p.edge}% | "
+            f"L5HR: {p.hitRates.get('l5Higher', '?')}% | L10HR: {p.hitRates.get('l10Higher', '?')}% | "
+            f"Game: {p.away_team or '?'} @ {p.home_team or '?'}"
+        )
+        if p.seasonAvg is not None:
+            line += f" | SeasonAvg: {p.seasonAvg}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _count_verdicts(picks: list[ScoredPick]) -> dict:
+    counts = {}
+    for p in picks:
+        counts[p.verdict] = counts.get(p.verdict, 0) + 1
+    return counts
+
+
+def _count_tiers(picks: list[ScoredPick]) -> dict:
+    counts = {}
+    for p in picks:
+        counts[p.tier] = counts.get(p.tier, 0) + 1
+    return counts
+
+
+# ─── Run with: uvicorn main:app --host 0.0.0.0 --port 8000 ─────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

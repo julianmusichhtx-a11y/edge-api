@@ -1,105 +1,188 @@
 """
-Core scoring engine.
-Takes enriched props and produces calibrated probabilities + edge.
-MVP uses weighted recent form + simple adjustments.
-Future: Replace with trained XGBoost / LightGBM per sport.
+Scoring engine — calculates model probabilities, market probabilities,
+edges, and verdicts from standardized player stats.
+
+This replaces propScoring.js. The math is sport-agnostic — it just needs
+season_avg, last5, last10, line, and odds.
 """
+from utils.odds_math import american_to_implied, classify_volatility, calculate_edge
 
-from typing import List, Dict, Any
-from utils.odds_math import american_to_implied_prob, calculate_ev
-import numpy as np
 
-def estimate_probability(prop: Dict[str, Any], platform: str) -> float:
+def score_prop(prop: dict) -> dict | None:
     """
-    Estimate P(Over hits) using available stats.
-    This is the heart of the 'predictive model'.
+    Score a single prop. Returns scoring data or None if insufficient data.
+
+    Input prop must have:
+      - _playerStats: { seasonAvg, last5, last10 }
+      - line: float
+      - higher_american_odds / lower_american_odds (optional)
+      - stat_display or stat_type: string
+
+    Returns dict with: modelProb, marketProb, edge, verdict, tier, volatility, signals, selectedSide
     """
-    stats = prop.get("player_stats", {})
-    line = prop["line"]
-    stat_type = prop["stat"]
+    stats = prop.get("_playerStats")
+    if not stats:
+        return None
 
-    season_avg = stats.get("season_avg", line)
-    last5 = stats.get("last_5_avg", season_avg)
-    last10 = stats.get("last_10_avg", season_avg)
-    usage = stats.get("usage_or_minutes", 30)  # proxy for opportunity
+    season_avg = stats.get("seasonAvg")
+    last5 = stats.get("last5", [])
+    last10 = stats.get("last10", [])
+    line = float(prop.get("line", 0))
 
-    # Weighted projection (more weight to recent)
-    projected = (last5 * 0.5 + last10 * 0.3 + season_avg * 0.2)
+    if len(last5) < 3 and season_avg is None:
+        return None
 
-    # Simple adjustments (extend this heavily)
-    adjustments = 0.0
-    if stats.get("recent_trend") == "hot":
-        adjustments += 0.08
-    if stats.get("recent_trend") == "cold":
-        adjustments -= 0.06
+    stat_display = prop.get("stat_display", prop.get("stat_type", "")).lower()
 
-    # Usage / opportunity boost
-    if usage and usage > 32:
-        adjustments += 0.04
+    # ── Calculate hit rates ──
+    higher_l5 = sum(1 for v in last5 if v > line) / max(len(last5), 1) if last5 else 0.5
+    higher_l10 = sum(1 for v in last10 if v > line) / max(len(last10), 1) if last10 else 0.5
+    lower_l5 = sum(1 for v in last5 if v < line) / max(len(last5), 1) if last5 else 0.5
+    lower_l10 = sum(1 for v in last10 if v < line) / max(len(last10), 1) if last10 else 0.5
 
-    # Matchup (very basic for MVP)
-    if "top-10 defense" in (stats.get("matchup_note") or "").lower():
-        adjustments -= 0.05
+    # ── Season average signal ──
+    avg_signal_higher = 0.0
+    avg_signal_lower = 0.0
+    if season_avg is not None and line > 0:
+        gap = (season_avg - line) / max(line, 0.5)
+        avg_signal_higher = min(max(gap * 0.3, -0.15), 0.15)
+        avg_signal_lower = -avg_signal_higher
 
-    final_proj = projected + (adjustments * projected * 0.15)  # dampen adjustment
+    # ── Smoothed hit rates (blend L5 and L10) ──
+    if last5 and last10:
+        smoothed_higher = higher_l5 * 0.6 + higher_l10 * 0.3 + (0.5 + avg_signal_higher) * 0.1
+        smoothed_lower = lower_l5 * 0.6 + lower_l10 * 0.3 + (0.5 + avg_signal_lower) * 0.1
+    elif last5:
+        smoothed_higher = higher_l5 * 0.7 + (0.5 + avg_signal_higher) * 0.3
+        smoothed_lower = lower_l5 * 0.7 + (0.5 + avg_signal_lower) * 0.3
+    else:
+        smoothed_higher = 0.5 + avg_signal_higher
+        smoothed_lower = 0.5 + avg_signal_lower
 
-    # Convert projection to probability of beating the line
-    # Use a simple logistic-like function (std ~ 8-12 for most props)
-    std = 9.5 if "Points" in stat_type or "Yards" in stat_type else 6.0
-    z = (final_proj - line) / std
-    prob = 1 / (1 + np.exp(-z * 1.2))  # calibrated-ish
+    # ── Clamp to reasonable range (no model should say 95%+) ──
+    smoothed_higher = max(0.20, min(0.85, smoothed_higher))
+    smoothed_lower = max(0.20, min(0.85, smoothed_lower))
 
-    # Clamp
-    return max(0.15, min(0.92, round(prob, 4)))
+    # ── Market probabilities from odds ──
+    higher_odds = prop.get("higher_american_odds") or prop.get("american_odds")
+    lower_odds = prop.get("lower_american_odds") or prop.get("lower_odds")
 
-def score_props(enriched_props: List[Dict], platform: str = "PrizePicks", min_edge: float = 0.05, persona: str = "hybrid") -> List[Dict]:
-    scored = []
-    for p in enriched_props:
-        model_prob = estimate_probability(p, platform)
+    higher_market = american_to_implied(higher_odds) if higher_odds else 0.5
+    lower_market = american_to_implied(lower_odds) if lower_odds else 0.5
 
-        # Market prob - assume typical -110 for most DFS unless provided
-        # In real version, we would pull from The Odds API for sharp consensus
-        market_prob = 0.5238  # ~ -110 implied (break even for -110)
+    # ── Calculate edges ──
+    higher_edge = smoothed_higher - (higher_market or 0.5)
+    lower_edge = smoothed_lower - (lower_market or 0.5)
 
-        edge = round(model_prob - market_prob, 4)
+    # ── Select best side ──
+    if higher_edge >= lower_edge:
+        selected_side = "Higher"
+        model_prob = smoothed_higher
+        market_prob = higher_market or 0.5
+        edge = higher_edge
+    else:
+        selected_side = "Lower"
+        model_prob = smoothed_lower
+        market_prob = lower_market or 0.5
+        edge = lower_edge
 
-        if edge >= min_edge + 0.03:
-            verdict = "PLAY"
-            tier = "A"
-        elif edge >= min_edge:
-            verdict = "LEAN"
-            tier = "B"
-        else:
-            verdict = "PASS"
-            tier = "C"
+    # ── Resolve canonical stat key for volatility ──
+    from config import PROP_STAT_MAP
+    stat_key = None
+    sd = stat_display.strip()
+    for prefix in ["1q ", "2q ", "1h ", "2h ", "first quarter ", "first half ", "second half "]:
+        if sd.startswith(prefix):
+            sd = sd[len(prefix):]
+            break
+    for k in sorted(PROP_STAT_MAP.keys(), key=len, reverse=True):
+        if k in sd or sd in k:
+            stat_key = PROP_STAT_MAP[k]
+            break
 
-        # Build rich context for the AI narrative generator (this is your moat)
-        stats = p.get("player_stats", {})
-        context_parts = [
-            f"Season avg {stats.get('season_avg', 'N/A')} vs line {p['line']}.",
-            f"Recent form (L5/L10): {stats.get('last_5_avg', 'N/A')}/{stats.get('last_10_avg', 'N/A')}.",
-            f"Trend: {stats.get('recent_trend', 'neutral')}.",
-            f"Matchup: {stats.get('matchup_note', 'standard')}.",
-            f"Usage/opportunity: {stats.get('usage_or_minutes', 'N/A')}.",
-        ]
-        if stats.get("note"):
-            context_parts.append(stats["note"])
+    volatility = classify_volatility(stat_key or "", line)
 
-        analysis_context = " | ".join(context_parts)
+    # ── Count signals ──
+    signals = 0
+    if last5 and higher_l5 >= 0.6: signals += 1
+    if last10 and higher_l10 >= 0.6: signals += 1
+    if season_avg is not None and season_avg > line * 1.1: signals += 1
+    if edge > 0.05: signals += 1
+    if edge > 0.15: signals += 1
 
-        scored.append({
-            "player": p["player"],
-            "stat": p["stat"],
-            "line": p["line"],
-            "sport": p["sport"],
-            "model_prob": model_prob,
-            "market_prob": market_prob,
-            "edge": edge,
-            "verdict": verdict,
-            "tier": tier,
-            "player_stats": stats,
-            "key_factors": [k for k in ["recent_form", "matchup", "usage", "trend"] if stats.get(k)],
-            "analysis_context": analysis_context,
-            "confidence": round(min(0.95, 0.6 + abs(edge) * 4), 2)  # Higher edge = higher confidence in our model
-        })
-    return scored
+    # ── Classify verdict and tier ──
+    verdict, tier = classify_pick(model_prob, edge, signals, volatility)
+
+    return {
+        "modelProb": round(model_prob * 100, 1),
+        "marketProb": round(market_prob * 100, 1),
+        "edge": round(edge * 100, 1),
+        "verdict": verdict,
+        "tier": tier,
+        "volatility": volatility,
+        "signals": signals,
+        "selectedSide": selected_side,
+        "hitRates": {
+            "l5Higher": round(higher_l5 * 100),
+            "l10Higher": round(higher_l10 * 100),
+            "l5Lower": round(lower_l5 * 100),
+            "l10Lower": round(lower_l10 * 100),
+        },
+        "seasonAvg": round(season_avg, 2) if season_avg else None,
+        "line": line,
+    }
+
+
+def classify_pick(model_prob: float, edge: float, signals: int, volatility: str) -> tuple[str, str]:
+    """Classify a pick into verdict and tier."""
+    if edge <= 0:
+        return "SKIP", "Pass"
+
+    # Tier classification
+    if model_prob >= 0.65 and signals >= 3 and volatility in ("low", "medium"):
+        tier = "A"
+    elif model_prob >= 0.58 and signals >= 2:
+        tier = "B"
+    elif model_prob >= 0.53:
+        tier = "C"
+    else:
+        tier = "Pass"
+
+    # Verdict classification
+    if tier == "Pass" or edge < 0.02:
+        verdict = "SKIP"
+    elif tier == "A" and edge >= 0.10:
+        verdict = "STRONG PLAY"
+    elif tier in ("A", "B") and edge >= 0.05:
+        verdict = "PLAY"
+    elif edge >= 0.03:
+        verdict = "LEAN"
+    else:
+        verdict = "SKIP"
+
+    return verdict, tier
+
+
+def filter_prop(prop: dict) -> dict:
+    """
+    Filter a prop before scoring.
+    Returns { status: 'pass' | 'hard_reject' | 'warn', reason: str }
+    """
+    stats = prop.get("_playerStats")
+    line = float(prop.get("line", 0))
+
+    # Fantasy props not supported
+    stat_display = prop.get("stat_display", prop.get("stat_type", "")).lower()
+    if "fantasy" in stat_display:
+        return {"status": "hard_reject", "reason": "Fantasy score props not supported"}
+
+    # Need player stats for multi-event props
+    if not stats and line > 0.5:
+        return {"status": "hard_reject", "reason": f"Multi-event prop (line {line}) requires player stats — none found"}
+
+    # Need minimum game data
+    if stats:
+        last5 = stats.get("last5", [])
+        if len(last5) < 3 and stats.get("seasonAvg") is None:
+            return {"status": "hard_reject", "reason": f"Insufficient player data (need 3+ recent games, found {len(last5)})"}
+
+    return {"status": "pass", "reason": ""}
