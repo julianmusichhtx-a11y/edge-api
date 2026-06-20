@@ -7,7 +7,15 @@ import logging
 
 from adapters import get_adapter
 from scoring.scorer import score_props
-from cache.cache_manager import get_cache, set_cache
+from cache.cache_manager import get, put   # ← Correct names
+
+# Then use them like this:
+cached = get(f"props:{sport}:{len(props)}")
+if cached:
+    return cached
+
+# After processing...
+put(f"props:{sport}:{len(props)}", result, ttl=300)
 
 app = FastAPI(title="EdgeLab Prediction API")
 
