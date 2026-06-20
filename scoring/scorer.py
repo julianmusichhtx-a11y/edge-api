@@ -162,6 +162,30 @@ def classify_pick(model_prob: float, edge: float, signals: int, volatility: str)
     return verdict, tier
 
 
+def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
+    """Score a batch of enriched props and separate into picks and passes."""
+    picks = []
+    passes = []
+
+    for prop in props:
+        scored = score_prop(prop)
+        if scored is None:
+            passes.append({**prop, "verdict": "SKIP", "reason": "Insufficient data"})
+            continue
+
+        result = {**prop, **scored}
+        if scored["edge"] >= min_edge * 100 and scored["verdict"] != "SKIP":
+            picks.append(result)
+        else:
+            passes.append(result)
+
+    return {
+        "picks": picks,
+        "passes": passes,
+        "stats_context": f"Scored {len(props)} props: {len(picks)} actionable, {len(passes)} passed",
+    }
+
+
 def filter_prop(prop: dict) -> dict:
     """
     Filter a prop before scoring.
