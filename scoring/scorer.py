@@ -104,8 +104,11 @@ def score_prop(prop: dict) -> dict | None:
     last5 = stats.get("last5", [])
     last10 = stats.get("last10", [])
     line = float(prop.get("line", 0))
+    sport_key_inner = prop.get("_sport_key", "")
 
-    if len(last5) < 3 and season_avg is None:
+    # Soccer needs at least 2 games to avoid binary 0%/100% hit rate artifacts
+    min_required = 2 if sport_key_inner == "soccer" else 3
+    if len(last5) < min_required and season_avg is None:
         return None
 
     stat_display = prop.get("stat_display", prop.get("stat_type", "")).lower()
@@ -204,6 +207,18 @@ def score_prop(prop: dict) -> dict | None:
         model_prob = smoothed_lower
         market_prob = mkt_l
         edge = lower_edge
+
+    # ── Suppress no-odds noise picks ──
+    # When the market defaults to exactly 50% (no real odds data), the "edge"
+    # is entirely model-driven with no market anchor. For soccer props with
+    # small samples (1-2 games), this produces hundreds of spurious 65%/50%
+    # picks. Require real market odds OR a higher model confidence threshold.
+    no_real_odds = (not prop.get("higher_american_odds") and not prop.get("lower_american_odds")
+                    and not prop.get("american_odds") and not prop.get("lower_odds"))
+    sport_key = prop.get("_sport_key", "")
+    if no_real_odds and sport_key == "soccer" and model_prob < 0.70:
+        # Not enough model confidence to call edge without real market data
+        return None
 
     # ── Resolve canonical stat key for volatility ──
     from config import PROP_STAT_MAP
@@ -337,7 +352,9 @@ def filter_prop(prop: dict) -> dict:
         last5 = stats.get("last5", [])
         # Soccer/tournament players may have only 1-2 games — allow if seasonAvg present
         # or if we have at least 1 game log entry (tournament context)
-        min_games = 1 if prop.get("_sport_key") == "soccer" else 3
+        # Soccer: WC players have few games — need 2+ to avoid 0/1 binary hit rate artifacts
+        # Other sports: 3+ games required
+        min_games = 2 if prop.get("_sport_key") == "soccer" else 3
         if len(last5) < min_games and stats.get("seasonAvg") is None:
             return {"status": "hard_reject", "reason": f"Insufficient player data (need {min_games}+ recent games, found {len(last5)})"}
 
