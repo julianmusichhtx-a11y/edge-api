@@ -59,9 +59,20 @@ def score_prop(prop: dict) -> dict | None:
         smoothed_higher = 0.5 + avg_signal_higher
         smoothed_lower = 0.5 + avg_signal_lower
 
-    # ── Clamp to reasonable range (no model should say 95%+) ──
-    smoothed_higher = max(0.20, min(0.85, smoothed_higher))
-    smoothed_lower = max(0.20, min(0.85, smoothed_lower))
+    # ── Clamp to calibrated range based on signal count ──
+    # The ceiling scales with signals so that B-tier picks (signals=2, fewer
+    # data points) can't rail against 85% just because they went 5-for-5 in L5.
+    # Real profitable edges live at 52-58% true probability; 80% should be rare.
+    # Counts populated before signals calc, so use raw hit-rate signals here:
+    raw_signals_estimate = 0
+    if last5 and higher_l5 >= 0.6: raw_signals_estimate += 1
+    if last10 and higher_l10 >= 0.6: raw_signals_estimate += 1
+    if season_avg is not None and season_avg > line * 1.1: raw_signals_estimate += 1
+    signal_ceiling = {0: 0.65, 1: 0.67, 2: 0.70, 3: 0.74, 4: 0.77, 5: 0.80}.get(
+        min(raw_signals_estimate + (2 if avg_signal_higher > 0.08 else 0), 5), 0.72
+    )
+    smoothed_higher = max(0.20, min(signal_ceiling, smoothed_higher))
+    smoothed_lower = max(0.20, min(signal_ceiling, smoothed_lower))
 
     # ── Market probabilities from odds ──
     higher_odds = prop.get("higher_american_odds") or prop.get("american_odds")
