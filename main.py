@@ -1,25 +1,16 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import traceback
 import logging
 
 from adapters import get_adapter
 from scoring.scorer import score_props
-from cache.cache_manager import get, put   # ← Correct names
-
-# Then use them like this:
-cached = get(f"props:{sport}:{len(props)}")
-if cached:
-    return cached
-
-# After processing...
-put(f"props:{sport}:{len(props)}", result, ttl=300)
+from cache.cache_manager import get, put
 
 app = FastAPI(title="EdgeLab Prediction API")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +36,7 @@ class PropInput(BaseModel):
     category: Optional[str] = ""
 
 
-class AnalyzeRequest(BaseModel):
+class PredictRequest(BaseModel):
     sport: str
     platform: str = "underdog"
     props: List[PropInput]
@@ -58,14 +49,14 @@ async def health():
 
 
 @app.post("/predict")
-async def predict(request: AnalyzeRequest):
+async def predict(request: PredictRequest):
     try:
         adapter = get_adapter(request.sport)
         if not adapter:
             raise HTTPException(status_code=400, detail=f"Unsupported sport: {request.sport}")
 
         enriched_props = []
-        errors = []
+        enrichment_errors = []
 
         for prop in request.props:
             try:
@@ -73,45 +64,49 @@ async def predict(request: AnalyzeRequest):
                 if enriched:
                     enriched_props.append(enriched)
             except Exception as e:
-                errors.append({
+                enrichment_errors.append({
                     "player": prop.player_name,
                     "stat": prop.stat_display,
                     "error": str(e)
                 })
-                logger.warning(f"Failed to enrich {prop.player_name} - {prop.stat_display}: {e}")
 
         if not enriched_props:
             return {
                 "picks": [],
                 "passes": [],
                 "stats_context": "",
-                "errors": errors,
-                "summary": {"actionable_picks": 0, "passes": 0}
+                "errors": enrichment_errors,
+                "summary": {
+                    "actionable_picks": 0,
+                    "passes": 0,
+                    "enriched": 0,
+                    "total": len(request.props)
+                }
             }
 
-        # Score the props
-        scored = score_props(enriched_props, min_edge=request.min_edge)
+        # Score using the batch function
+        scored_result = score_props(enriched_props, min_edge=request.min_edge)
 
         return {
-            "picks": scored.get("picks", []),
-            "passes": scored.get("passes", []),
-            "stats_context": scored.get("stats_context", ""),
-            "errors": errors,
+            "picks": scored_result.get("picks", []),
+            "passes": scored_result.get("passes", []),
+            "stats_context": scored_result.get("stats_context", ""),
+            "errors": enrichment_errors,
             "summary": {
-                "actionable_picks": len(scored.get("picks", [])),
-                "passes": len(scored.get("passes", [])),
+                "actionable_picks": len(scored_result.get("picks", [])),
+                "passes": len(scored_result.get("passes", [])),
                 "enriched": len(enriched_props),
                 "total": len(request.props)
             }
         }
 
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Prediction failed: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500,
             detail={
-                "error": "Internal prediction error",
+                "error": "Prediction service error",
                 "message": str(e),
                 "type": type(e).__name__
             }
