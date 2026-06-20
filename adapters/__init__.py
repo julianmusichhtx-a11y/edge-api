@@ -1,4 +1,4 @@
-from .base_adapter import BaseAdapter
+from .base_adapter import BaseSportAdapter
 from .mlb_adapter import MLBAdapter
 from .sport_adapters import NBAAdapter, WNBAAdapter, NFLAdapter, NHLAdapter, SoccerAdapter
 
