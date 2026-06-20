@@ -60,9 +60,15 @@ async def predict(request: PredictRequest):
 
         for prop in request.props:
             try:
-                enriched = adapter.enrich_prop(prop.dict())
+                # Try to use enrich_prop if it exists, otherwise use raw data
+                if hasattr(adapter, "enrich_prop"):
+                    enriched = adapter.enrich_prop(prop.dict())
+                else:
+                    enriched = prop.dict()
+
                 if enriched:
                     enriched_props.append(enriched)
+
             except Exception as e:
                 enrichment_errors.append({
                     "player": prop.player_name,
@@ -84,7 +90,7 @@ async def predict(request: PredictRequest):
                 }
             }
 
-        # Score using the batch function
+        # Score the enriched props
         scored_result = score_props(enriched_props, min_edge=request.min_edge)
 
         return {
@@ -101,7 +107,7 @@ async def predict(request: PredictRequest):
         }
 
     except Exception as e:
-        logger.error(f"Prediction failed: {str(e)}")
+        logger.error(f"Prediction error: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500,
