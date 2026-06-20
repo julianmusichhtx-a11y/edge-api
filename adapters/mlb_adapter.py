@@ -58,13 +58,12 @@ class MLBAdapter(BaseSportAdapter):
             if game_info:
                 enriched.update(game_info)
 
-            # More lenient verdict
             enriched["verdict"] = "PICK" if enriched.get("is_confirmed") else "SKIP"
             enriched["reason"] = "Confirmed in lineup" if enriched.get("is_confirmed") else "Lineup not confirmed"
 
             return enriched
         except Exception as e:
-            logger.warning(f"Enrich error: {e}")
+            logger.warning(f"Enrich error for {player_name}: {e}")
             return prop
 
     def enrich_props(self, props: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -74,4 +73,47 @@ class MLBAdapter(BaseSportAdapter):
             results.extend([self.enrich_prop(p) for p in batch])
         return results
 
-    # ... (keep the rest of the methods from previous version: _fetch_lineup_status, _fetch_mlb_game_info, _is_pitcher_prop, etc.)
+    def get_player_stats(self, player_name: str) -> Dict[str, Any]:
+        # Placeholder - can be expanded later with Sportradar or other sources
+        return {}
+
+    def get_todays_games(self) -> List[Dict[str, Any]]:
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            url = f"{MLB_SCHEDULE_URL}?sportId=1&date={today}"
+            with httpx.Client(timeout=4) as client:
+                data = client.get(url).json()
+                return data.get("dates", [{}])[0].get("games", [])
+        except:
+            return []
+
+    def _is_pitcher_prop(self, stat: str) -> bool:
+        return any(k in stat for k in ["strikeout", "pitch", "era", "whip"])
+
+    def _fetch_lineup_status(self, player: str) -> Optional[Dict]:
+        try:
+            with httpx.Client(timeout=2.5) as client:
+                res = client.get(f"{LINEUP_STATUS_URL}?player={player}")
+                return res.json() if res.status_code == 200 else None
+        except:
+            return None
+
+    def _fetch_mlb_game_info(self, player: str) -> Optional[Dict]:
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            url = f"{MLB_SCHEDULE_URL}?sportId=1&date={today}&hydrate=team,venue"
+            with httpx.Client(timeout=3) as client:
+                data = client.get(url).json()
+                games = data.get("dates", [{}])[0].get("games", [])
+                for g in games:
+                    home = g.get("teams", {}).get("home", {}).get("team", {}).get("name", "")
+                    away = g.get("teams", {}).get("away", {}).get("team", {}).get("name", "")
+                    if player.lower() in (home + away).lower():
+                        return {
+                            "game_time": g.get("gameDate"),
+                            "home_team": home,
+                            "away_team": away,
+                        }
+            return None
+        except:
+            return None
