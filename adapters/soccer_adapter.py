@@ -173,7 +173,40 @@ class SoccerAdapter(BaseSportAdapter):
                        .get("totals", {})
                        .get("competitors", [])
             )
+
+            # Build opponent defensive stats: for each team, record how many
+            # goals/shots_on_target they CONCEDED (= the other team's totals)
+            team_totals = {}
             for comp in competitors:
+                team_id = comp.get("id", "")
+                team_stats = comp.get("statistics", {})
+                goals_scored = int(team_stats.get("goals_scored", 0))
+                shots_on_target = int(team_stats.get("shots_on_target", 0))
+                team_totals[team_id] = {
+                    "goals_scored": goals_scored,
+                    "shots_on_target": shots_on_target,
+                    "team_name": comp.get("name", ""),
+                    "qualifier": comp.get("qualifier", ""),
+                }
+
+            # Map each team's conceded stats from the other team's scored stats
+            team_ids = list(team_totals.keys())
+            opponent_def_stats = {}
+            if len(team_ids) == 2:
+                opponent_def_stats[team_ids[0]] = {
+                    "goals_conceded": team_totals[team_ids[1]]["goals_scored"],
+                    "sot_conceded": team_totals[team_ids[1]]["shots_on_target"],
+                    "opponent_name": team_totals[team_ids[1]]["team_name"],
+                }
+                opponent_def_stats[team_ids[1]] = {
+                    "goals_conceded": team_totals[team_ids[0]]["goals_scored"],
+                    "sot_conceded": team_totals[team_ids[0]]["shots_on_target"],
+                    "opponent_name": team_totals[team_ids[0]]["team_name"],
+                }
+
+            for comp in competitors:
+                team_id = comp.get("id", "")
+                opp_stats = opponent_def_stats.get(team_id, {})
                 for player in comp.get("players", []):
                     raw_name = player.get("name", "")
                     if not raw_name:
@@ -181,6 +214,11 @@ class SoccerAdapter(BaseSportAdapter):
 
                     norm = self._normalize_name(raw_name)
                     stats = player.get("statistics", {})
+
+                    # Attach opponent defensive context to each game log entry
+                    stats["_opp_goals_conceded"] = opp_stats.get("goals_conceded", 0)
+                    stats["_opp_sot_conceded"] = opp_stats.get("sot_conceded", 0)
+                    stats["_opponent_name"] = opp_stats.get("opponent_name", "")
 
                     if norm not in self._name_to_id:
                         self._name_to_id[norm] = player.get("id", "")
@@ -264,11 +302,22 @@ class SoccerAdapter(BaseSportAdapter):
             season_avg = sum(last10) / len(last10) if last10 else None
 
             # World Cup: players may have only 1-3 games — allow with lower threshold
+            # Compute opponent defensive averages across last 5 games
+            opp_goals_conceded_l5 = [g.get("_opp_goals_conceded", 0) for g in game_log[:5]]
+            opp_sot_conceded_l5 = [g.get("_opp_sot_conceded", 0) for g in game_log[:5]]
+            avg_opp_goals_conceded = round(sum(opp_goals_conceded_l5) / max(len(opp_goals_conceded_l5), 1), 2)
+            avg_opp_sot_conceded = round(sum(opp_sot_conceded_l5) / max(len(opp_sot_conceded_l5), 1), 2)
+            last_opponent = game_log[0].get("_opponent_name", "") if game_log else ""
+
             prop["_playerStats"] = {
                 "seasonAvg": round(season_avg, 2) if season_avg is not None else None,
                 "last5": last5,
                 "last10": last10,
                 "last15": [],
+                # Opponent defensive context — used by AI for narrative quality
+                "oppGoalsConcededL5": avg_opp_goals_conceded,
+                "oppShotsConcededL5": avg_opp_sot_conceded,
+                "lastOpponent": last_opponent,
             }
             prop["_sport_key"] = "soccer"
             enriched += 1

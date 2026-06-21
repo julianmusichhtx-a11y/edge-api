@@ -209,6 +209,8 @@ def score_prop(prop: dict) -> dict | None:
     # ── Direction-aware signal ceiling ──
     # Now that we know which side we picked, compute how many signals actually
     # support that direction and tighten the model_prob ceiling accordingly.
+    # 1st inning props are near-coinflip — cap them at 0.68 max regardless of signals.
+    is_inning_prop = prop.get("_is_inning_prop", False)
     raw_signals_estimate = 0
     if selected_side == "Higher":
         if last5 and higher_l5 >= 0.6: raw_signals_estimate += 1
@@ -220,9 +222,11 @@ def score_prop(prop: dict) -> dict | None:
         if last10 and lower_l10 >= 0.6: raw_signals_estimate += 1
         if use_lambda and season_avg < line * 0.9: raw_signals_estimate += 1
         big_avg_gap = use_lambda and season_avg < line * 0.9 and (line - season_avg) / max(line, 0.5) > 0.3
-    signal_ceiling = {0: 0.63, 1: 0.65, 2: 0.68, 3: 0.71, 4: 0.74, 5: 0.77}.get(
+    base_ceiling = {0: 0.63, 1: 0.65, 2: 0.68, 3: 0.71, 4: 0.74, 5: 0.77}.get(
         min(raw_signals_estimate + (2 if big_avg_gap else 0), 5), 0.70
     )
+    # 1st inning props: hard cap at 0.68 regardless of signals — near-coinflip by nature
+    signal_ceiling = min(base_ceiling, 0.68) if is_inning_prop else base_ceiling
     model_prob = max(0.20, min(signal_ceiling, model_prob))
 
     # ── Suppress no-odds noise picks ──
@@ -398,6 +402,13 @@ def filter_prop(prop: dict) -> dict:
     if not stats and line > 0.5:
         return {"status": "hard_reject", "reason": f"Multi-event prop (line {line}) requires player stats — none found"}
 
+    # 1st inning props (hits allowed, runs allowed) are near-coinflip by base rate.
+    # Require a strong signal (season data clearly supports direction) before passing.
+    # Tag them so scorer can apply a tighter signal ceiling.
+    is_inning_prop = any(x in stat_display for x in ["1st inn", "1st inning", "first inn", "1h ", "1h hits", "1h runs"])
+    if is_inning_prop:
+        prop["_is_inning_prop"] = True
+
     # Need minimum game data
     if stats:
         last5 = stats.get("last5", [])
@@ -408,5 +419,16 @@ def filter_prop(prop: dict) -> dict:
         min_games = 1 if prop.get("_sport_key") == "soccer" else 3  # WC 2026: players may have 1-3 games
         if len(last5) < min_games and stats.get("seasonAvg") is None:
             return {"status": "hard_reject", "reason": f"Insufficient player data (need {min_games}+ recent games, found {len(last5)})"}
+
+    # FIX #5: Lineup confirmation required for batter props
+    # If MLB adapter confirmed the player is NOT in today's lineup, hard reject.
+    # Pitchers skip this check — they're confirmed by being listed as the starter.
+    sport_key_fp = prop.get("_sport_key", "")
+    if sport_key_fp == "mlb" and not prop.get("is_pitcher", False):
+        lineup_status = prop.get("lineup_status", {})
+        status_val = lineup_status.get("status", "") if lineup_status else ""
+        # Only hard-reject if we got a positive "OUT" signal — don't reject on missing data
+        if status_val in ("OUT", "SCRATCHED", "DNP"):
+            return {"status": "hard_reject", "reason": f"Player not in today's lineup ({status_val})"}
 
     return {"status": "pass", "reason": ""}
