@@ -227,9 +227,13 @@ def score_prop(prop: dict) -> dict | None:
     no_real_odds = (not prop.get("higher_american_odds") and not prop.get("lower_american_odds")
                     and not prop.get("american_odds") and not prop.get("lower_odds"))
     sport_key = prop.get("_sport_key", "")
-    if no_real_odds and sport_key == "soccer" and model_prob < 0.70:
-        # Not enough model confidence to call edge without real market data
-        return None
+    if no_real_odds and sport_key == "soccer":
+        # Lower props without real odds are trivially satisfied for low-output players
+        # (a defender with avg=0.1 goals always scores 90%+ on Lower 0.5 via Poisson).
+        # Require a higher threshold for Lower to avoid flooding with these.
+        threshold = 0.85 if selected_side == "Lower" else 0.70
+        if model_prob < threshold:
+            return None
 
     # ── Resolve canonical stat key for volatility ──
     from config import PROP_STAT_MAP
