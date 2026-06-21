@@ -134,13 +134,19 @@ def score_prop(prop: dict) -> dict | None:
         poisson_higher = _poisson_prob_higher(season_avg, line)
         poisson_lower = _poisson_prob_lower(season_avg, line)
 
-        # Recent form as a 30% adjustment (not replacement) relative to Poisson base
-        # This captures hot/cold streaks without letting a 4/5 L5 dominate
-        adj_higher = (recent_higher - poisson_higher) * 0.30
-        adj_lower = (recent_lower - poisson_lower) * 0.30
-
-        smoothed_higher = poisson_higher + adj_higher
-        smoothed_lower = poisson_lower + adj_lower
+        # For soccer: small WC samples (1-3 games), stay close to Poisson
+        # For MLB: blend Poisson with recent hit rates — game logs are reliable
+        if sport_key_inner == "soccer":
+            recency_weight = 0.20
+            adj_higher = (recent_higher - poisson_higher) * recency_weight
+            adj_lower = (recent_lower - poisson_lower) * recency_weight
+            smoothed_higher = poisson_higher + adj_higher
+            smoothed_lower = poisson_lower + adj_lower
+        else:
+            # MLB/other: blend Poisson (40%) with recent hit rates (60%)
+            # Poisson anchors against small-sample noise; recent form captures real streaks
+            smoothed_higher = poisson_higher * 0.40 + recent_higher * 0.60
+            smoothed_lower = poisson_lower * 0.40 + recent_lower * 0.60
 
     else:
         # For higher lines: blend season-avg signal with recent form
@@ -172,8 +178,8 @@ def score_prop(prop: dict) -> dict | None:
     # pull it 35% back toward market. This is a safety valve for cases where
     # our model is reacting to a small sample and the market likely has better data.
     # We keep 65% of our signal — enough to still have edge, but capped.
-    DAMPENER_THRESHOLD = 0.28
-    DAMPENER_PULL = 0.35
+    DAMPENER_THRESHOLD = 0.25
+    DAMPENER_PULL = 0.38
 
     mkt_h = higher_market or 0.5
     mkt_l = lower_market or 0.5
@@ -214,8 +220,8 @@ def score_prop(prop: dict) -> dict | None:
         if last10 and lower_l10 >= 0.6: raw_signals_estimate += 1
         if use_lambda and season_avg < line * 0.9: raw_signals_estimate += 1
         big_avg_gap = use_lambda and season_avg < line * 0.9 and (line - season_avg) / max(line, 0.5) > 0.3
-    signal_ceiling = {0: 0.65, 1: 0.67, 2: 0.70, 3: 0.74, 4: 0.77, 5: 0.80}.get(
-        min(raw_signals_estimate + (2 if big_avg_gap else 0), 5), 0.72
+    signal_ceiling = {0: 0.63, 1: 0.65, 2: 0.68, 3: 0.71, 4: 0.74, 5: 0.77}.get(
+        min(raw_signals_estimate + (2 if big_avg_gap else 0), 5), 0.70
     )
     model_prob = max(0.20, min(signal_ceiling, model_prob))
 
@@ -243,7 +249,7 @@ def score_prop(prop: dict) -> dict | None:
         # Lower props on weak/balanced markets are trivially satisfied for low-output players.
         # Require strong signal support: signals >= 3 means at least one game-log signal
         # actually supports the direction, not just Poisson math on a small sample.
-        if selected_side == "Lower" and signals < 3:
+        if selected_side == "Lower" and raw_signals_estimate < 2:
             return None
         threshold = 0.82 if selected_side == "Lower" else 0.68
         if model_prob < threshold:
