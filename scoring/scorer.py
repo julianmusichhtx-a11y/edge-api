@@ -107,7 +107,7 @@ def score_prop(prop: dict) -> dict | None:
     sport_key_inner = prop.get("_sport_key", "")
 
     # Soccer needs at least 2 games to avoid binary 0%/100% hit rate artifacts
-    min_required = 2 if sport_key_inner == "soccer" else 3
+    min_required = 1 if sport_key_inner == "soccer" else 3  # WC 2026: players may have 1-3 games
     if len(last5) < min_required and season_avg is None:
         return None
 
@@ -227,11 +227,25 @@ def score_prop(prop: dict) -> dict | None:
     no_real_odds = (not prop.get("higher_american_odds") and not prop.get("lower_american_odds")
                     and not prop.get("american_odds") and not prop.get("lower_odds"))
     sport_key = prop.get("_sport_key", "")
-    if no_real_odds and sport_key == "soccer":
-        # Lower props without real odds are trivially satisfied for low-output players
-        # (a defender with avg=0.1 goals always scores 90%+ on Lower 0.5 via Poisson).
-        # Require a higher threshold for Lower to avoid flooding with these.
-        threshold = 0.85 if selected_side == "Lower" else 0.70
+
+    # Detect "balanced" lines — Underdog posts -110/-110 on many soccer props
+    # which gives market ~47.6%/47.6%. Treat these like no-odds for suppression.
+    higher_odds_val = prop.get("higher_american_odds") or prop.get("american_odds")
+    lower_odds_val = prop.get("lower_american_odds") or prop.get("lower_odds")
+    balanced_line = (
+        higher_odds_val and lower_odds_val and
+        abs(float(str(higher_odds_val).replace("+","")) - abs(float(str(lower_odds_val).replace("+","")))) <= 5
+        and abs(float(str(higher_odds_val).replace("+",""))) <= 115
+    )
+    weak_market = no_real_odds or balanced_line
+
+    if weak_market and sport_key == "soccer":
+        # Lower props on weak/balanced markets are trivially satisfied for low-output players.
+        # Require strong signal support: signals >= 3 means at least one game-log signal
+        # actually supports the direction, not just Poisson math on a small sample.
+        if selected_side == "Lower" and signals < 3:
+            return None
+        threshold = 0.82 if selected_side == "Lower" else 0.68
         if model_prob < threshold:
             return None
 
@@ -385,7 +399,7 @@ def filter_prop(prop: dict) -> dict:
         # or if we have at least 1 game log entry (tournament context)
         # Soccer: WC players have few games — need 2+ to avoid 0/1 binary hit rate artifacts
         # Other sports: 3+ games required
-        min_games = 2 if prop.get("_sport_key") == "soccer" else 3
+        min_games = 1 if prop.get("_sport_key") == "soccer" else 3  # WC 2026: players may have 1-3 games
         if len(last5) < min_games and stats.get("seasonAvg") is None:
             return {"status": "hard_reject", "reason": f"Insufficient player data (need {min_games}+ recent games, found {len(last5)})"}
 

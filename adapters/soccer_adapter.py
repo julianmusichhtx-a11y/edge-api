@@ -51,12 +51,14 @@ class SoccerAdapter(BaseSportAdapter):
     STAT_EXTRACTORS = {
         "goals":            lambda s: int(s.get("goals_scored", 0)),
         "assists":          lambda s: int(s.get("assists", 0)),
+        "goals_assists":    lambda s: int(s.get("goals_scored", 0)) + int(s.get("assists", 0)),
         "shots_on_target":  lambda s: int(s.get("shots_on_target", 0)),
         "shots":            lambda s: (
             int(s.get("shots_on_target", 0)) +
             int(s.get("shots_off_target", 0)) +
             int(s.get("shots_blocked", 0))
         ),
+        "goals_allowed":    lambda s: int(s.get("goals_conceded", s.get("goals_against", 0))),
         "tackles":          lambda s: int(s.get("tackles", 0)),
         "passes":           lambda s: int(s.get("passes", 0)),
         "yellow_cards":     lambda s: int(s.get("yellow_cards", 0)),
@@ -193,16 +195,25 @@ class SoccerAdapter(BaseSportAdapter):
     def _resolve_stat_key(self, stat_display: str) -> Optional[str]:
         """Map Underdog stat display strings to our canonical keys."""
         sd = stat_display.lower().strip()
+
+        # Strip half-time prefixes before matching
+        for prefix in ["1h ", "2h ", "first half ", "second half "]:
+            if sd.startswith(prefix):
+                sd = sd[len(prefix):]
+                break
+
         mapping = {
             "goals": "goals", "goal scored": "goals", "soccer goals": "goals",
             "assists": "assists", "soccer assists": "assists",
+            "goals + assists": "goals_assists", "goals+assists": "goals_assists",
             "shots on target": "shots_on_target", "shots on goal": "shots_on_target",
-            "shots": "shots", "total shots": "shots",
+            "shots attempted": "shots", "shots": "shots", "total shots": "shots",
             "tackles": "tackles",
             "passes": "passes",
             "yellow cards": "yellow_cards",
             "corner kicks": "corner_kicks",
             "offsides": "offsides",
+            "goals allowed": "goals_allowed",
         }
         if sd in mapping:
             return mapping[sd]
