@@ -137,11 +137,14 @@ def score_prop(prop: dict) -> dict | None:
         # For soccer: small WC samples (1-3 games), stay close to Poisson
         # For MLB: blend Poisson with recent hit rates — game logs are reliable
         if sport_key_inner == "soccer":
-            recency_weight = 0.20
-            adj_higher = (recent_higher - poisson_higher) * recency_weight
-            adj_lower = (recent_lower - poisson_lower) * recency_weight
+            # Higher props: allow more recency weight since WC games are informative
+            # Lower props: stay close to Poisson to avoid the balanced-line flood
+            recency_weight_higher = 0.40  # WC games are informative; trust recent form more
+            recency_weight_lower  = 0.15  # Stay close to Poisson to suppress Lower noise
+            adj_higher = (recent_higher - poisson_higher) * recency_weight_higher
+            adj_lower  = (recent_lower  - poisson_lower)  * recency_weight_lower
             smoothed_higher = poisson_higher + adj_higher
-            smoothed_lower = poisson_lower + adj_lower
+            smoothed_lower  = poisson_lower  + adj_lower
         else:
             # MLB/other: blend Poisson (40%) with recent hit rates (60%)
             # Poisson anchors against small-sample noise; recent form captures real streaks
@@ -161,10 +164,11 @@ def score_prop(prop: dict) -> dict | None:
         smoothed_higher = recent_higher * 0.55 + (0.5 + avg_signal_higher) * 0.45
         smoothed_lower = recent_lower * 0.55 + (0.5 + avg_signal_lower) * 0.45
 
-    # ── Pre-selection ceiling (loose) ──
-    # Cap at 0.80 before side selection; direction-aware ceiling applied below.
-    smoothed_higher = max(0.20, min(0.80, smoothed_higher))
-    smoothed_lower = max(0.20, min(0.80, smoothed_lower))
+    # ── Pre-selection ceiling ──
+    # Cap at 0.74 before side selection; direction-aware ceiling applied below.
+    # Lower than before (was 0.80) to prevent inflated inputs to the dampener.
+    smoothed_higher = max(0.20, min(0.74, smoothed_higher))
+    smoothed_lower = max(0.20, min(0.74, smoothed_lower))
 
     # ── Market probabilities from odds (de-vigged) ──
     # De-vigging removes the bookmaker's margin before computing edge.
@@ -188,8 +192,11 @@ def score_prop(prop: dict) -> dict | None:
         vig_magnitude = 0.0
 
     # ── Market-anchoring dampener ──
-    DAMPENER_THRESHOLD = 0.25
-    DAMPENER_PULL = 0.38
+    # Threshold reduced from 0.25 → 0.20: fire dampener sooner
+    # Pull increased from 0.38 → 0.45: pull harder toward market when model deviates
+    # This specifically targets props where model deviates >20pp from market
+    DAMPENER_THRESHOLD = 0.20
+    DAMPENER_PULL = 0.45
 
     # Use de-vigged for edge calculation, raw for dampener reference
     mkt_h = higher_market_true
@@ -225,15 +232,40 @@ def score_prop(prop: dict) -> dict | None:
         if last5 and higher_l5 >= 0.6: raw_signals_estimate += 1
         if last10 and higher_l10 >= 0.6: raw_signals_estimate += 1
         if use_lambda and season_avg > line * 1.1: raw_signals_estimate += 1
-        big_avg_gap = use_lambda and season_avg > line * 1.1 and (season_avg - line) / max(line, 0.5) > 0.3
     else:
         if last5 and lower_l5 >= 0.6: raw_signals_estimate += 1
         if last10 and lower_l10 >= 0.6: raw_signals_estimate += 1
         if use_lambda and season_avg < line * 0.9: raw_signals_estimate += 1
-        big_avg_gap = use_lambda and season_avg < line * 0.9 and (line - season_avg) / max(line, 0.5) > 0.3
-    signal_ceiling = {0: 0.63, 1: 0.65, 2: 0.68, 3: 0.71, 4: 0.74, 5: 0.77}.get(
-        min(raw_signals_estimate + (2 if big_avg_gap else 0), 5), 0.70
+    # Signal ceiling — deliberately conservative.
+    # Max 3 raw signals (L5, L10, season_avg). big_avg_gap no longer gives bonus
+    # signals because season_avg vs line is already captured by L5/L10 hit rates.
+    # Ceiling lowered from 0.77 to 0.72 max to prevent systematic overconfidence.
+    #
+    # Stat-specific adjustments:
+    #   - runs/rbi: sequencing-dependent, reduce ceiling by 0.03 (need hit + baserunner)
+    #   - goals (soccer): rare events, reduce ceiling by 0.02
+    #   - 1st inning props: near-coinflip, hard cap at 0.66
+    is_sequencing_stat = any(x in stat_display for x in ["runs", "rbi", "goals allowed"])
+    is_goals_only = stat_display in ("goals", "soccer goals", "goal scored")
+    is_inning_prop = prop.get("_is_inning_prop", False)
+
+    base_ceiling = {0: 0.60, 1: 0.62, 2: 0.65, 3: 0.68, 4: 0.70, 5: 0.72}.get(
+        min(raw_signals_estimate, 5), 0.65
     )
+    if is_inning_prop:
+        signal_ceiling = min(base_ceiling, 0.66)
+    elif is_sequencing_stat:
+        signal_ceiling = base_ceiling - 0.03
+    elif is_goals_only and sport_key_inner == "soccer":
+        # Only penalize goals ceiling when selecting Lower (reducing noise)
+        # For Higher goals picks, full ceiling applies since market already priced it high
+        if selected_side == "Lower":
+            signal_ceiling = base_ceiling - 0.02
+        else:
+            signal_ceiling = base_ceiling
+    else:
+        signal_ceiling = base_ceiling
+
     model_prob = max(0.20, min(signal_ceiling, model_prob))
 
     # ── Suppress no-odds noise picks ──
@@ -249,11 +281,16 @@ def score_prop(prop: dict) -> dict | None:
     # which gives market ~47.6%/47.6%. Treat these like no-odds for suppression.
     higher_odds_val = prop.get("higher_american_odds") or prop.get("american_odds")
     lower_odds_val = prop.get("lower_american_odds") or prop.get("lower_odds")
-    balanced_line = (
-        higher_odds_val and lower_odds_val and
-        abs(float(str(higher_odds_val).replace("+","")) - abs(float(str(lower_odds_val).replace("+","")))) <= 5
-        and abs(float(str(higher_odds_val).replace("+",""))) <= 115
-    )
+    try:
+        h_abs = abs(float(str(higher_odds_val).replace("+", ""))) if higher_odds_val else None
+        l_abs = abs(float(str(lower_odds_val).replace("+", ""))) if lower_odds_val else None
+        balanced_line = (
+            h_abs is not None and l_abs is not None and
+            abs(h_abs - l_abs) <= 8 and          # within 8 points of each other
+            h_abs <= 120                           # neither side heavily juiced
+        )
+    except (ValueError, TypeError):
+        balanced_line = False
     weak_market = no_real_odds or balanced_line
 
     if weak_market and sport_key == "soccer":
