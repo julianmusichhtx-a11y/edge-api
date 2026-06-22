@@ -548,6 +548,243 @@ def classify_pick(model_prob: float, edge: float, signals: int, volatility: str)
     return verdict, tier
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 5: Correlation Matrix for Flex Builds
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Stat categories used for correlation classification
+_BATTER_COUNTING = {"hits", "runs", "rbi", "total_bases", "hits_runs_rbis", "home_runs", "stolen_bases", "walks"}
+_BATTER_K        = {"batter_strikeouts"}
+_PITCHER_STATS   = {"strikeouts", "earned_runs", "hits_allowed", "walks_allowed", "outs_pitched", "pitcher_outs"}
+_GOAL_STATS      = {"goals", "goals_assists", "shots", "shots_on_goal", "shots_on_target"}
+_SCORING_STATS   = {"points", "rebounds", "assists", "blocks", "steals", "threes"}
+
+def _stat_category(stat_display: str) -> str:
+    """Map a stat_display string to a broad category for correlation logic."""
+    sd = stat_display.lower().strip()
+    for s in _PITCHER_STATS:
+        if s in sd:
+            return "pitcher"
+    for s in _BATTER_K:
+        if s in sd:
+            return "batter_k"
+    for s in _BATTER_COUNTING:
+        if s in sd:
+            return "batter_counting"
+    for s in _GOAL_STATS:
+        if s in sd:
+            return "goal"
+    for s in _SCORING_STATS:
+        if s in sd:
+            return "scoring"
+    return "other"
+
+
+def _game_key(pick: dict) -> str | None:
+    """
+    Return a canonical game identifier: 'AWAY@HOME' with teams alphabetically
+    consistent so the same game always maps to the same key regardless of which
+    team's player we're looking at.
+    """
+    home = (pick.get("home_team") or "").strip().upper()
+    away = (pick.get("away_team") or "").strip().upper()
+    if not home and not away:
+        return None
+    # Canonical form: alphabetical so it's consistent regardless of prop origin
+    teams = sorted([t for t in [home, away] if t])
+    return "@".join(teams)
+
+
+def _compute_correlation(pick_a: dict, pick_b: dict) -> str:
+    """
+    Classify the correlation between two picks sharing the same game.
+
+    Returns:
+        "positive"  — both props benefit from the same game script
+        "negative"  — props compete (one winning makes the other less likely)
+        "neutral"   — same game but no strong correlation
+        "none"      — different games (caller should check game_key first)
+    """
+    cat_a = _stat_category(pick_a.get("stat_display", ""))
+    cat_b = _stat_category(pick_b.get("stat_display", ""))
+    side_a = (pick_a.get("selectedSide") or "").lower()
+    side_b = (pick_b.get("selectedSide") or "").lower()
+
+    # Same player — always highly correlated (or competing for PAs)
+    if (pick_a.get("player_name") or "").lower() == (pick_b.get("player_name") or "").lower():
+        if cat_a in ("batter_counting", "batter_k") and cat_b in ("batter_counting", "batter_k"):
+            # Walks + RBI or K + counting stats compete for plate appearances
+            if "walk" in pick_a.get("stat_display", "").lower() and "rbi" in pick_b.get("stat_display", "").lower():
+                return "negative"
+            if "rbi" in pick_a.get("stat_display", "").lower() and "walk" in pick_b.get("stat_display", "").lower():
+                return "negative"
+            return "positive"
+        return "positive"
+
+    # Cross-player correlations by category pairs
+    if cat_a == "pitcher" and cat_b == "batter_counting":
+        # Pitcher strikeouts Higher + batter hits Lower: pitcher dominates → negative correlation
+        if "strikeout" in pick_a.get("stat_display", "").lower() and side_a == "higher" and side_b == "lower":
+            return "negative"
+        # Pitcher allowing hits/runs Higher + batter hits Higher: hitter-friendly game → positive
+        if ("earned" in pick_a.get("stat_display", "").lower() or "hit" in pick_a.get("stat_display", "").lower()) and side_a == "higher" and side_b == "higher":
+            return "positive"
+        return "neutral"
+
+    if cat_a == "batter_counting" and cat_b == "pitcher":
+        # Mirror of above
+        if "strikeout" in pick_b.get("stat_display", "").lower() and side_b == "higher" and side_a == "lower":
+            return "negative"
+        if ("earned" in pick_b.get("stat_display", "").lower() or "hit" in pick_b.get("stat_display", "").lower()) and side_b == "higher" and side_a == "higher":
+            return "positive"
+        return "neutral"
+
+    if cat_a == "batter_counting" and cat_b == "batter_counting":
+        # Two batters from same team on a high-total game: positively correlated
+        if pick_a.get("player_team", "").upper() == pick_b.get("player_team", "").upper():
+            if side_a == side_b:
+                return "positive"
+        return "neutral"
+
+    if cat_a == "goal" and cat_b == "goal":
+        # Soccer: two goal props from same team — positive if higher, competing budget otherwise
+        if pick_a.get("player_team", "").upper() == pick_b.get("player_team", "").upper():
+            if side_a == "higher" and side_b == "higher":
+                return "positive"
+        return "neutral"
+
+    if cat_a == "scoring" and cat_b == "scoring":
+        # Basketball: same team players — positively correlated for high-pace games
+        if pick_a.get("player_team", "").upper() == pick_b.get("player_team", "").upper():
+            if side_a == side_b:
+                return "positive"
+        return "neutral"
+
+    return "neutral"
+
+
+def _annotate_correlations(picks: list[dict]) -> list[dict]:
+    """
+    For each pick, compute:
+        gameKey              — canonical game identifier (or None)
+        sameGamePicks        — list of player_name+stat combos sharing this game
+        correlations         — list of {player, stat, side, correlationType} for same-game peers
+        maxPositiveCorr      — count of positive-correlation same-game peers (flex build hint)
+        maxNegativeCorr      — count of negative-correlation same-game peers (hedge hint)
+
+    This runs in O(n²) over actionable picks only — fine for typical slate sizes of 20-60.
+    """
+    # Attach gameKey to each pick first
+    for p in picks:
+        p["gameKey"] = _game_key(p)
+
+    # Group by game
+    game_groups: dict[str, list[dict]] = {}
+    for p in picks:
+        gk = p.get("gameKey")
+        if gk:
+            if gk not in game_groups:
+                game_groups[gk] = []
+            game_groups[gk].append(p)
+
+    # Annotate each pick with its same-game peers and correlation types
+    for p in picks:
+        gk = p.get("gameKey")
+        peers = [q for q in game_groups.get(gk, []) if q is not p] if gk else []
+
+        corr_list = []
+        for peer in peers:
+            corr_type = _compute_correlation(p, peer)
+            corr_list.append({
+                "player":          peer.get("player_name", ""),
+                "stat":            peer.get("stat_display", ""),
+                "side":            peer.get("selectedSide", ""),
+                "correlationType": corr_type,
+            })
+
+        p["correlations"]     = corr_list
+        p["sameGamePicks"]    = [f"{c['player']} {c['stat']}" for c in corr_list]
+        p["maxPositiveCorr"]  = sum(1 for c in corr_list if c["correlationType"] == "positive")
+        p["maxNegativeCorr"]  = sum(1 for c in corr_list if c["correlationType"] == "negative")
+
+    return picks
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FEATURE 10: +EV Composite Score
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_composite_ev(pick: dict) -> dict:
+    """
+    Compute a single +EV composite score (0-100) combining:
+        - Model probability (normalized distance above 50%)
+        - Edge against de-vigged market
+        - Signal count (quality of supporting evidence)
+        - Kelly EV per dollar (profitability proxy)
+        - Volatility penalty (high-vol props discounted)
+        - Sample size bonus (more data = more reliable)
+
+    The score is designed so:
+        < 40  = below threshold, not actionable
+        40-59 = C-tier lean, marginal
+        60-74 = B-tier play, solid edge
+        75-89 = A-tier strong play
+        90+   = A-tier, strong play with multiple confirming signals
+
+    Returns dict with compositeEV and compositeEVLabel.
+    """
+    model_prob  = (pick.get("modelProb") or 50) / 100
+    edge        = (pick.get("edge") or 0) / 100
+    signals     = pick.get("signals") or 0
+    volatility  = (pick.get("volatility") or "medium").lower()
+    kelly       = pick.get("kelly") or {}
+    ev_dollar   = kelly.get("ev_per_dollar") if isinstance(kelly, dict) else None
+    sample_size = len((pick.get("_playerStats") or {}).get("last10") or
+                      (pick.get("_playerStats") or {}).get("last5") or [])
+
+    # Model component: how far above the 50% coin-flip is the model?
+    # Scale: 0% above → 0 points, 30%+ above → 40 points (ceiling)
+    model_component = min(40, ((model_prob - 0.50) / 0.30) * 40)
+
+    # Edge component: raw edge against de-vigged market
+    # Scale: 0% edge → 0 points, 20%+ edge → 35 points (ceiling)
+    edge_component = min(35, (edge / 0.20) * 35)
+
+    # Signal component: number of confirming signals
+    # Each signal worth ~4 points, max 20 points at 5 signals
+    signal_component = min(20, signals * 4)
+
+    # Kelly EV bonus: positive EV per dollar adds up to 10 points
+    if ev_dollar is not None and ev_dollar > 0:
+        kelly_component = min(10, ev_dollar * 20)
+    else:
+        kelly_component = 0
+
+    # Volatility penalty
+    vol_penalty = {"high": 12, "medium": 4, "low": 0}.get(volatility, 4)
+
+    # Sample size bonus (up to 5 points): rewards picks with more game history
+    sample_bonus = min(5, sample_size * 0.5)
+
+    raw_score = model_component + edge_component + signal_component + kelly_component + sample_bonus - vol_penalty
+    composite = max(0, min(100, raw_score))
+
+    if composite >= 75:
+        label = "Strong Play"
+    elif composite >= 60:
+        label = "Play"
+    elif composite >= 40:
+        label = "Lean"
+    else:
+        label = "Below Threshold"
+
+    return {
+        "compositeEV":      round(composite, 1),
+        "compositeEVLabel": label,
+    }
+
+
 def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
     """Score a batch of enriched props and separate into picks and passes."""
     picks = []
@@ -560,10 +797,19 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
             continue
 
         result = {**prop, **scored}
+
+        # Feature 10: attach +EV composite score to every result
+        composite = _compute_composite_ev(result)
+        result.update(composite)
+
         if scored["edge"] >= min_edge * 100 and scored["verdict"] != "SKIP":
             picks.append(result)
         else:
             passes.append(result)
+
+    # Feature 5: annotate all actionable picks with same-game correlation data
+    if picks:
+        picks = _annotate_correlations(picks)
 
     return {
         "picks": picks,
