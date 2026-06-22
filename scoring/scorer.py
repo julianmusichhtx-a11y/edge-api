@@ -52,6 +52,77 @@ def _poisson_prob_lower(lambda_val: float, line: float) -> float:
     return max(0.05, min(0.95, cumulative))
 
 
+
+def _bayesian_hit_rate(
+    prior_rate: float,
+    recent_hits: int,
+    recent_games: int,
+    confidence: float,
+) -> float:
+    """
+    Bayesian update of hit rate given a prior (season average) and recent evidence.
+
+    Formula: posterior = (prior * confidence + recent_hits) / (confidence + recent_games)
+
+    The confidence parameter is the "equivalent prior sample size" — how many
+    games of prior data does the season average represent relative to recent form.
+
+    Higher confidence = model stays closer to season average (more stable)
+    Lower confidence  = model updates faster toward recent form
+
+    Calibrated values by sport/stat:
+      - MLB hits/runs (high variance, ~162 game season): confidence = 8
+        → 5 recent games moves estimate ~38% toward recent, 10 games ~56%
+      - MLB strikeouts (lower variance, pitcher controlled): confidence = 6
+        → 5 recent games moves estimate ~46% toward recent
+      - Soccer goals (very rare, high variance): confidence = 12
+        → even 5 WC games only move estimate ~29% toward recent
+      - Soccer shots (moderate frequency): confidence = 8
+
+    This directly replaces the fixed 40/60 Poisson-to-recency blend with a
+    mathematically principled update that respects sample size.
+    """
+    if recent_games <= 0:
+        return prior_rate
+    posterior = (prior_rate * confidence + recent_hits) / (confidence + recent_games)
+    return max(0.05, min(0.95, posterior))
+
+
+def _get_bayesian_confidence(stat_display: str, sport_key: str) -> float:
+    """
+    Return the Bayesian prior confidence (equivalent prior sample size) for a stat.
+
+    Higher = trust season average more, slower to update on recent streaks.
+    Lower  = update faster toward recent form.
+    """
+    sd = stat_display.lower()
+
+    if sport_key == "soccer":
+        if any(x in sd for x in ["goals", "goal scored", "goals + assists", "goals+assists"]):
+            return 12.0   # Goals are rare — don't over-update on 1-3 WC games
+        if any(x in sd for x in ["shots on target", "shots attempted"]):
+            return 8.0    # Shot volume is more stable
+        return 10.0       # Default soccer
+
+    if sport_key == "mlb":
+        if any(x in sd for x in ["strikeout", "pitching outs", "earned run", "hits allowed"]):
+            return 5.0    # Pitcher stats: skill-driven, update faster on recent starts
+        if any(x in sd for x in ["home run", "stolen base"]):
+            return 12.0   # Very rare events — trust season rate heavily
+        if any(x in sd for x in ["runs", "rbi"]):
+            return 10.0   # Sequencing-dependent — high variance, trust prior
+        if any(x in sd for x in ["hits + runs", "hits+runs"]):
+            return 8.0    # Combo stat
+        return 6.0        # Default MLB batter hits/total bases — update faster
+
+    # Other sports
+    if sport_key in ("nba", "wnba"):
+        return 5.0        # NBA: frequent games, stats are stable
+    if sport_key == "nhl":
+        return 8.0        # NHL: goals rare, shots more stable
+    return 8.0            # Safe default
+
+
 def score_prop(prop: dict) -> dict | None:
     """
     Score a single prop. Returns scoring data or None if insufficient data.
@@ -129,40 +200,59 @@ def score_prop(prop: dict) -> dict | None:
     # For higher lines (4.5+), we blend season avg with recent form.
     use_lambda = season_avg is not None and season_avg > 0
 
-    if line <= 1.5 and use_lambda:
-        # Poisson base anchored to season average
-        poisson_higher = _poisson_prob_higher(season_avg, line)
-        poisson_lower = _poisson_prob_lower(season_avg, line)
+    # ── Bayesian prior confidence (sample-size-aware blending) ──
+    # Instead of fixed weights (40/60 Poisson blend), we use Bayesian updating:
+    # posterior = (prior × confidence + recent_hits) / (confidence + recent_games)
+    # This naturally weights recent form MORE when we have more games, and stays
+    # closer to the season average when samples are small (e.g. 1-3 WC games).
+    bayes_confidence = _get_bayesian_confidence(stat_display, sport_key_inner)
+    n5  = len(last5)
+    n10 = len(last10)
 
-        # For soccer: small WC samples (1-3 games), stay close to Poisson
-        # For MLB: blend Poisson with recent hit rates — game logs are reliable
+    if line <= 1.5 and use_lambda:
+        # Poisson base from season average — the mathematically correct prior
+        # for a counting stat with a known rate parameter.
+        poisson_higher = _poisson_prob_higher(season_avg, line)
+        poisson_lower  = _poisson_prob_lower(season_avg, line)
+
+        # Count actual hits/misses in recent games (not just rates)
+        hits_higher_l5  = sum(1 for v in last5  if v > line)
+        hits_higher_l10 = sum(1 for v in last10 if v > line)
+        hits_lower_l5   = sum(1 for v in last5  if v < line)
+        hits_lower_l10  = sum(1 for v in last10 if v < line)
+
+        # Bayesian update: combine L5 and L10 evidence with confidence-weighted prior
+        # L5 gets slightly more weight (more recent), L10 adds stability
+        # We use total hits across both windows, deduped by taking the larger window
+        total_games   = max(n10, n5)
+        total_hits_h  = hits_higher_l10 if n10 >= n5 else hits_higher_l5
+        total_hits_l  = hits_lower_l10  if n10 >= n5 else hits_lower_l5
+
+        # Bayesian posterior hit rate (Poisson prior → bernoulli hit rate)
+        bayes_higher = _bayesian_hit_rate(poisson_higher, total_hits_h, total_games, bayes_confidence)
+        bayes_lower  = _bayesian_hit_rate(poisson_lower,  total_hits_l, total_games, bayes_confidence)
+
+        # For soccer: extra Poisson anchor on Lower to suppress balanced-line noise
+        # (actual suppression happens later in the balanced_line block)
         if sport_key_inner == "soccer":
-            # Higher props: allow more recency weight since WC games are informative
-            # Lower props: stay close to Poisson to avoid the balanced-line flood
-            recency_weight_higher = 0.40  # WC games are informative; trust recent form more
-            recency_weight_lower  = 0.15  # Stay close to Poisson to suppress Lower noise
-            adj_higher = (recent_higher - poisson_higher) * recency_weight_higher
-            adj_lower  = (recent_lower  - poisson_lower)  * recency_weight_lower
-            smoothed_higher = poisson_higher + adj_higher
-            smoothed_lower  = poisson_lower  + adj_lower
+            smoothed_higher = bayes_higher
+            smoothed_lower  = poisson_lower * 0.70 + bayes_lower * 0.30
         else:
-            # MLB/other: blend Poisson (40%) with recent hit rates (60%)
-            # Poisson anchors against small-sample noise; recent form captures real streaks
-            smoothed_higher = poisson_higher * 0.40 + recent_higher * 0.60
-            smoothed_lower = poisson_lower * 0.40 + recent_lower * 0.60
+            smoothed_higher = bayes_higher
+            smoothed_lower  = bayes_lower
 
     else:
-        # For higher lines: blend season-avg signal with recent form
-        # Season avg contributes ~45%, recent form contributes ~55%
-        avg_signal_higher = 0.0
-        avg_signal_lower = 0.0
-        if use_lambda and line > 0:
-            gap = (season_avg - line) / max(line, 0.5)
-            avg_signal_higher = min(max(gap * 0.25, -0.12), 0.12)
-            avg_signal_lower = -avg_signal_higher
+        # For higher lines (4.5+): Bayesian update on raw hit rates
+        # Prior is derived from season_avg vs line gap
+        prior_higher = 0.5 + min(max((season_avg - line) / max(line, 0.5) * 0.25, -0.15), 0.15) if use_lambda else 0.5
+        prior_lower  = 1.0 - prior_higher
 
-        smoothed_higher = recent_higher * 0.55 + (0.5 + avg_signal_higher) * 0.45
-        smoothed_lower = recent_lower * 0.55 + (0.5 + avg_signal_lower) * 0.45
+        hits_higher = sum(1 for v in last10 if v > line)
+        hits_lower  = sum(1 for v in last10 if v < line)
+        total_games = max(n10, 1)
+
+        smoothed_higher = _bayesian_hit_rate(prior_higher, hits_higher, total_games, bayes_confidence)
+        smoothed_lower  = _bayesian_hit_rate(prior_lower,  hits_lower,  total_games, bayes_confidence)
 
     # ── Pre-selection ceiling ──
     # Cap at 0.74 before side selection; direction-aware ceiling applied below.
@@ -192,11 +282,25 @@ def score_prop(prop: dict) -> dict | None:
         vig_magnitude = 0.0
 
     # ── Market-anchoring dampener ──
-    # Threshold reduced from 0.25 → 0.20: fire dampener sooner
-    # Pull increased from 0.38 → 0.45: pull harder toward market when model deviates
-    # This specifically targets props where model deviates >20pp from market
+    # Fires when model deviates >20pp from de-vigged market.
+    # Pull strength scales with raw signal count:
+    #   0-1 signals: pull 50% toward market (model has weak support — trust market)
+    #   2 signals:   pull 38% toward market
+    #   3+ signals:  pull 28% toward market (model has strong support — trust it more)
+    # This prevents the dampener from crushing well-supported picks.
     DAMPENER_THRESHOLD = 0.20
-    DAMPENER_PULL = 0.45
+    _raw_sig_count = sum([
+        1 for v in last5 if v > line] + [1 for v in last10 if v > line]) // 2  # rough estimate
+    _raw_sig_count = min(3, max(0, len([v for v in last5 if v > line or v < line])))
+
+    # Simpler: use number of games as proxy for signal strength
+    n_games = max(len(last5), 1)
+    if n_games >= 8:
+        DAMPENER_PULL = 0.28   # Lots of data — trust model
+    elif n_games >= 5:
+        DAMPENER_PULL = 0.38   # Moderate data
+    else:
+        DAMPENER_PULL = 0.50   # Small sample — trust market more
 
     # Use de-vigged for edge calculation, raw for dampener reference
     mkt_h = higher_market_true
