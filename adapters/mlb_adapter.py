@@ -149,6 +149,34 @@ class MLBAdapter(BaseSportAdapter):
             if player_stats:
                 enriched["_playerStats"] = player_stats
 
+        # ── Feature 4: Opponent Defensive Rating ──
+        # For batter props, fetch the opposing pitcher's season stats so the
+        # scorer and AI can factor in matchup quality (ERA, WHIP, K rate).
+        # For pitcher props, we skip this — they ARE the pitcher.
+        if not is_pitcher:
+            try:
+                probables = self._get_todays_probables(client)
+                team_id = self._get_team_id_for_player(player_name, client)
+                if team_id and probables:
+                    # The opposing pitcher is the one pitching AGAINST our player's team
+                    opp_entry = probables.get(team_id)
+                    if opp_entry:
+                        pitcher_id = opp_entry.get("pitcher_id")
+                        pitcher_stats = self._get_pitcher_season_stats(pitcher_id, client)
+                        if pitcher_stats:
+                            enriched["_oppPitcher"] = {
+                                "name":            opp_entry.get("pitcher_name", ""),
+                                "team":            opp_entry.get("opponent_name", ""),
+                                "era":             pitcher_stats.get("era"),
+                                "whip":            pitcher_stats.get("whip"),
+                                "k_per_9":         pitcher_stats.get("k_per_9"),
+                                "bb_per_9":        pitcher_stats.get("bb_per_9"),
+                                "hits_per_9":      pitcher_stats.get("hits_per_9"),
+                                "avg_ip_per_start":pitcher_stats.get("avg_ip_per_start"),
+                            }
+            except Exception as e:
+                logger.debug(f"Opponent pitcher lookup failed for {player_name}: {e}")
+
         return enriched
 
     def _resolve_stat_key(self, stat_display: str) -> Optional[str]:
@@ -261,6 +289,134 @@ class MLBAdapter(BaseSportAdapter):
             result = None
         cache.put("player_gamelog", f"lineup:{cache_key}", result or {})
         return result
+
+
+    def _get_todays_probables(self, client: httpx.Client) -> dict:
+        """
+        Fetch today's probable pitchers for all games.
+        Returns dict: { team_id: { pitcher_id, pitcher_name, team_name, opponent_team_id } }
+        Cached for the full day since probables don't change once posted.
+        """
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        cache_key = f"probables:{today_key}"
+        cached = cache.get("schedule", cache_key)
+        if cached is not None:
+            return cached or {}
+
+        url = (f"{MLB_STATS_BASE}/schedule?sportId=1&date={today_key}"
+               f"&hydrate=probablePitcher,team")
+        data = _http_get(client, url)
+        probables = {}
+
+        if data:
+            for date_entry in data.get("dates", []):
+                for game in date_entry.get("games", []):
+                    home = game.get("teams", {}).get("home", {})
+                    away = game.get("teams", {}).get("away", {})
+
+                    home_team_id = home.get("team", {}).get("id")
+                    away_team_id = away.get("team", {}).get("id")
+                    home_team_name = home.get("team", {}).get("name", "")
+                    away_team_name = away.get("team", {}).get("name", "")
+
+                    home_pitcher = home.get("probablePitcher", {})
+                    away_pitcher = away.get("probablePitcher", {})
+
+                    if home_pitcher and home_team_id:
+                        probables[home_team_id] = {
+                            "pitcher_id":       home_pitcher.get("id"),
+                            "pitcher_name":     home_pitcher.get("fullName", ""),
+                            "team_name":        home_team_name,
+                            "opponent_team_id": away_team_id,
+                            "opponent_name":    away_team_name,
+                        }
+                    if away_pitcher and away_team_id:
+                        probables[away_team_id] = {
+                            "pitcher_id":       away_pitcher.get("id"),
+                            "pitcher_name":     away_pitcher.get("fullName", ""),
+                            "team_name":        away_team_name,
+                            "opponent_team_id": home_team_id,
+                            "opponent_name":    home_team_name,
+                        }
+
+        cache.put("schedule", cache_key, probables or {})
+        return probables
+
+    def _get_pitcher_season_stats(self, pitcher_id: int, client: httpx.Client) -> Optional[dict]:
+        """
+        Fetch a pitcher's season stats from the MLB Stats API.
+        Returns key metrics: ERA, WHIP, K/9, BB/9, hits allowed per game, K rate.
+        Cached per pitcher for the day.
+        """
+        if not pitcher_id:
+            return None
+
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        cache_key = f"pitcher_season:{pitcher_id}:{today_key}"
+        cached = cache.get("player_season", cache_key)
+        if cached is not None:
+            return cached or None
+
+        season = datetime.now().year
+        url = (f"{MLB_STATS_BASE}/people/{pitcher_id}/stats"
+               f"?stats=season&group=pitching&season={season}")
+        data = _http_get(client, url)
+
+        stats = None
+        if data:
+            for stat_block in data.get("stats", []):
+                splits = stat_block.get("splits", [])
+                if splits:
+                    s = splits[0].get("stat", {})
+                    ip = float(s.get("inningsPitched", 0) or 0)
+                    games = int(s.get("gamesStarted", s.get("gamesPitched", 1)) or 1)
+                    hits = int(s.get("hits", 0) or 0)
+                    k = int(s.get("strikeOuts", 0) or 0)
+                    bb = int(s.get("baseOnBalls", 0) or 0)
+                    er = int(s.get("earnedRuns", 0) or 0)
+
+                    stats = {
+                        "era":              round(float(s.get("era", 0) or 0), 2),
+                        "whip":             round(float(s.get("whip", 0) or 0), 2),
+                        "k_per_9":          round((k / max(ip, 1)) * 9, 1),
+                        "bb_per_9":         round((bb / max(ip, 1)) * 9, 1),
+                        "hits_per_9":       round((hits / max(ip, 1)) * 9, 1),
+                        "k_rate":           round(float(s.get("strikeoutPercentage", 0) or 0), 3),
+                        "innings_pitched":  ip,
+                        "games_started":    games,
+                        "avg_ip_per_start": round(ip / max(games, 1), 1),
+                    }
+                    break
+
+        cache.put("player_season", cache_key, stats or {})
+        return stats
+
+    def _get_team_id_for_player(self, player_name: str, client: httpx.Client) -> Optional[int]:
+        """
+        Look up a player's current team ID via the MLB Stats API.
+        Used to match a batter to their team's probable pitcher opponent.
+        Cached per player per day.
+        """
+        player_id = self._player_id_lookup(player_name, client)
+        if not player_id:
+            return None
+
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        cache_key = f"team_id:{player_id}:{today_key}"
+        cached = cache.get("player_season", cache_key)
+        if cached is not None:
+            return cached or None
+
+        url = f"{MLB_STATS_BASE}/people/{player_id}?hydrate=currentTeam"
+        data = _http_get(client, url)
+        team_id = None
+        if data:
+            people = data.get("people", [])
+            if people:
+                team_id = people[0].get("currentTeam", {}).get("id")
+
+        cache.put("player_season", cache_key, team_id or 0)
+        return team_id
 
     def _schedule_url(self) -> str:
         today = datetime.now().strftime("%Y-%m-%d")

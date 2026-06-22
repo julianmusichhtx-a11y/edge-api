@@ -254,6 +254,38 @@ def score_prop(prop: dict) -> dict | None:
         smoothed_higher = _bayesian_hit_rate(prior_higher, hits_higher, total_games, bayes_confidence)
         smoothed_lower  = _bayesian_hit_rate(prior_lower,  hits_lower,  total_games, bayes_confidence)
 
+    # ── Feature 4: Opponent Defensive Rating adjustment ──
+    # For MLB batter props, adjust model probability based on opposing pitcher quality.
+    # A pitcher with ERA 2.00 suppresses hits more than one with ERA 5.00.
+    # Adjustment is small (max ±6pp) to avoid overriding the Bayesian model.
+    opp_pitcher = prop.get("_oppPitcher")
+    if opp_pitcher and sport_key_inner == "mlb" and not prop.get("is_pitcher"):
+        era  = opp_pitcher.get("era")
+        whip = opp_pitcher.get("whip")
+        k9   = opp_pitcher.get("k_per_9")
+
+        if era is not None and whip is not None:
+            # ERA-based adjustment: league average ERA ~4.20
+            # Elite pitcher (ERA 2.50): -4pp on Higher hits
+            # Poor pitcher (ERA 5.50): +4pp on Higher hits
+            era_adj = max(-0.06, min(0.06, (float(era) - 4.20) * 0.015))
+
+            # WHIP-based adjustment: league average WHIP ~1.30
+            # Low WHIP (1.00): extra -2pp on Higher hits
+            whip_adj = max(-0.03, min(0.03, (float(whip) - 1.30) * 0.08))
+
+            # K/9 adjustment for strikeout props specifically
+            k9_adj = 0.0
+            if k9 is not None and any(x in stat_display for x in ["strikeout", "batter strikeout"]):
+                # High K/9 pitcher → Higher batter strikeouts more likely
+                k9_adj = max(-0.04, min(0.04, (float(k9) - 8.5) * 0.008))
+
+            total_adj = era_adj + whip_adj + k9_adj
+
+            # Apply: positive total_adj means pitcher is hittable → boost Higher, cut Lower
+            smoothed_higher = max(0.15, min(0.80, smoothed_higher + total_adj))
+            smoothed_lower  = max(0.15, min(0.80, smoothed_lower  - total_adj))
+
     # ── Pre-selection ceiling ──
     # Cap at 0.74 before side selection; direction-aware ceiling applied below.
     # Lower than before (was 0.80) to prevent inflated inputs to the dampener.
