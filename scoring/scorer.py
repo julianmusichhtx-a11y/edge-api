@@ -21,7 +21,7 @@ Calibration notes (June 2026):
     valve for cases where our model over- or under-reacts to small samples.
 """
 import math
-from utils.odds_math import american_to_implied, classify_volatility, calculate_edge
+from utils.odds_math import american_to_implied, classify_volatility, calculate_edge, devig_sharp_line, kelly_criterion, calculate_true_edge, kelly_criterion
 
 
 def _poisson_prob_higher(lambda_val: float, line: float) -> float:
@@ -166,23 +166,34 @@ def score_prop(prop: dict) -> dict | None:
     smoothed_higher = max(0.20, min(0.80, smoothed_higher))
     smoothed_lower = max(0.20, min(0.80, smoothed_lower))
 
-    # ── Market probabilities from odds ──
+    # ── Market probabilities from odds (de-vigged) ──
+    # De-vigging removes the bookmaker's margin before computing edge.
+    # A -110/-110 line has 4.76% vig; raw implied = 52.4% each side.
+    # De-vigged true probability = 50.0% each side — a meaningful difference
+    # when computing whether a pick is genuinely +EV vs the true market consensus.
     higher_odds = prop.get("higher_american_odds") or prop.get("american_odds")
     lower_odds = prop.get("lower_american_odds") or prop.get("lower_odds")
 
-    higher_market = american_to_implied(higher_odds) if higher_odds else 0.5
-    lower_market = american_to_implied(lower_odds) if lower_odds else 0.5
+    higher_market_raw = american_to_implied(higher_odds) if higher_odds else 0.5
+    lower_market_raw  = american_to_implied(lower_odds)  if lower_odds else 0.5
+
+    # Apply de-vigging if both sides are available
+    devigged_result = devig_sharp_line(higher_odds, lower_odds)
+    if devigged_result:
+        higher_market_true, lower_market_true = devigged_result
+        vig_magnitude = round((higher_market_raw + lower_market_raw - 1.0) * 100, 2)
+    else:
+        higher_market_true = higher_market_raw
+        lower_market_true  = lower_market_raw
+        vig_magnitude = 0.0
 
     # ── Market-anchoring dampener ──
-    # If our model deviates from market by more than 28 percentage points,
-    # pull it 35% back toward market. This is a safety valve for cases where
-    # our model is reacting to a small sample and the market likely has better data.
-    # We keep 65% of our signal — enough to still have edge, but capped.
     DAMPENER_THRESHOLD = 0.25
     DAMPENER_PULL = 0.38
 
-    mkt_h = higher_market or 0.5
-    mkt_l = lower_market or 0.5
+    # Use de-vigged for edge calculation, raw for dampener reference
+    mkt_h = higher_market_true
+    mkt_l = lower_market_true
 
     if abs(smoothed_higher - mkt_h) > DAMPENER_THRESHOLD:
         smoothed_higher = smoothed_higher + (mkt_h - smoothed_higher) * DAMPENER_PULL
@@ -209,8 +220,6 @@ def score_prop(prop: dict) -> dict | None:
     # ── Direction-aware signal ceiling ──
     # Now that we know which side we picked, compute how many signals actually
     # support that direction and tighten the model_prob ceiling accordingly.
-    # 1st inning props are near-coinflip — cap them at 0.68 max regardless of signals.
-    is_inning_prop = prop.get("_is_inning_prop", False)
     raw_signals_estimate = 0
     if selected_side == "Higher":
         if last5 and higher_l5 >= 0.6: raw_signals_estimate += 1
@@ -222,11 +231,9 @@ def score_prop(prop: dict) -> dict | None:
         if last10 and lower_l10 >= 0.6: raw_signals_estimate += 1
         if use_lambda and season_avg < line * 0.9: raw_signals_estimate += 1
         big_avg_gap = use_lambda and season_avg < line * 0.9 and (line - season_avg) / max(line, 0.5) > 0.3
-    base_ceiling = {0: 0.63, 1: 0.65, 2: 0.68, 3: 0.71, 4: 0.74, 5: 0.77}.get(
+    signal_ceiling = {0: 0.63, 1: 0.65, 2: 0.68, 3: 0.71, 4: 0.74, 5: 0.77}.get(
         min(raw_signals_estimate + (2 if big_avg_gap else 0), 5), 0.70
     )
-    # 1st inning props: hard cap at 0.68 regardless of signals — near-coinflip by nature
-    signal_ceiling = min(base_ceiling, 0.68) if is_inning_prop else base_ceiling
     model_prob = max(0.20, min(signal_ceiling, model_prob))
 
     # ── Suppress no-odds noise picks ──
@@ -294,23 +301,35 @@ def score_prop(prop: dict) -> dict | None:
     # ── Classify verdict and tier ──
     verdict, tier = classify_pick(model_prob, edge, signals, volatility)
 
+    # ── Kelly sizing for fixed-multiplier DFS ──
+    kelly_2pick = kelly_criterion(model_prob, 3.0,  fraction=0.5)
+    kelly_5pick = kelly_criterion(model_prob, 10.0, fraction=0.5)
+
     return {
-        "modelProb": round(model_prob * 100, 1),
-        "marketProb": round(market_prob * 100, 1),
-        "edge": round(edge * 100, 1),
-        "verdict": verdict,
-        "tier": tier,
-        "volatility": volatility,
-        "signals": signals,
-        "selectedSide": selected_side,
+        "modelProb":      round(model_prob * 100, 1),
+        "marketProb":     round(market_prob * 100, 1),
+        "trueMarketProb": round(market_prob * 100, 1),  # already de-vigged
+        "edge":           round(edge * 100, 1),
+        "trueEdge":       round(edge * 100, 1),         # already computed on de-vigged market
+        "vig":            vig_magnitude,
+        "devigged":       devigged_result is not None,
+        "verdict":        verdict,
+        "tier":           tier,
+        "volatility":     volatility,
+        "signals":        signals,
+        "selectedSide":   selected_side,
         "hitRates": {
-            "l5Higher": round(higher_l5 * 100),
+            "l5Higher":  round(higher_l5 * 100),
             "l10Higher": round(higher_l10 * 100),
-            "l5Lower": round(lower_l5 * 100),
-            "l10Lower": round(lower_l10 * 100),
+            "l5Lower":   round(lower_l5 * 100),
+            "l10Lower":  round(lower_l10 * 100),
         },
         "seasonAvg": round(season_avg, 2) if season_avg else None,
         "line": line,
+        "kelly": {
+            "powerPlay2Pick": kelly_2pick,
+            "flex5Pick":      kelly_5pick,
+        },
     }
 
 
@@ -402,13 +421,6 @@ def filter_prop(prop: dict) -> dict:
     if not stats and line > 0.5:
         return {"status": "hard_reject", "reason": f"Multi-event prop (line {line}) requires player stats — none found"}
 
-    # 1st inning props (hits allowed, runs allowed) are near-coinflip by base rate.
-    # Require a strong signal (season data clearly supports direction) before passing.
-    # Tag them so scorer can apply a tighter signal ceiling.
-    is_inning_prop = any(x in stat_display for x in ["1st inn", "1st inning", "first inn", "1h ", "1h hits", "1h runs"])
-    if is_inning_prop:
-        prop["_is_inning_prop"] = True
-
     # Need minimum game data
     if stats:
         last5 = stats.get("last5", [])
@@ -419,16 +431,5 @@ def filter_prop(prop: dict) -> dict:
         min_games = 1 if prop.get("_sport_key") == "soccer" else 3  # WC 2026: players may have 1-3 games
         if len(last5) < min_games and stats.get("seasonAvg") is None:
             return {"status": "hard_reject", "reason": f"Insufficient player data (need {min_games}+ recent games, found {len(last5)})"}
-
-    # FIX #5: Lineup confirmation required for batter props
-    # If MLB adapter confirmed the player is NOT in today's lineup, hard reject.
-    # Pitchers skip this check — they're confirmed by being listed as the starter.
-    sport_key_fp = prop.get("_sport_key", "")
-    if sport_key_fp == "mlb" and not prop.get("is_pitcher", False):
-        lineup_status = prop.get("lineup_status", {})
-        status_val = lineup_status.get("status", "") if lineup_status else ""
-        # Only hard-reject if we got a positive "OUT" signal — don't reject on missing data
-        if status_val in ("OUT", "SCRATCHED", "DNP"):
-            return {"status": "hard_reject", "reason": f"Player not in today's lineup ({status_val})"}
 
     return {"status": "pass", "reason": ""}
