@@ -24,6 +24,172 @@ import math
 from utils.odds_math import american_to_implied, classify_volatility, calculate_edge, devig_sharp_line, kelly_criterion, calculate_true_edge, kelly_criterion
 
 
+def _safe_float(value) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        num = float(value)
+        if math.isnan(num) or math.isinf(num):
+            return None
+        return num
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_numbers(values) -> list[float]:
+    if not isinstance(values, list):
+        return []
+    return [num for num in (_safe_float(v) for v in values) if num is not None]
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _std_dev(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    avg = _mean(values)
+    variance = sum((v - avg) ** 2 for v in values) / (len(values) - 1)
+    return math.sqrt(variance)
+
+
+def _default_projection_volatility(sport: str, stat: str) -> float:
+    sd = (stat or "").lower()
+    sport_key = (sport or "").lower()
+    if sport_key in ("nba", "wnba"):
+        if any(x in sd for x in ("points", "rebounds", "assists", "pra")):
+            return 6.0
+        return 3.5
+    if sport_key == "mlb":
+        if any(x in sd for x in ("home run", "stolen base")):
+            return 1.2
+        if any(x in sd for x in ("strikeout", "pitching outs")):
+            return 2.5
+        return 1.8
+    if sport_key == "soccer":
+        if any(x in sd for x in ("goal", "assist")):
+            return 1.0
+        return 3.0
+    return 4.0
+
+
+def estimate_probability_from_projection(
+    projection: float,
+    line: float,
+    std_dev: float | None,
+    sample_size: int,
+    sport: str,
+    stat: str,
+) -> float:
+    """
+    Conservative projection-vs-line probability estimate.
+
+    This is exposed for projection metadata only; the existing scorer's
+    calibrated modelProb remains the canonical score when score_prop has data.
+    """
+    projection = float(projection)
+    line = float(line)
+    sample_size = max(0, int(sample_size or 0))
+    sigma = std_dev if std_dev and std_dev > 0 else _default_projection_volatility(sport, stat)
+    sigma = max(float(sigma), 0.75)
+
+    z = (projection - line) / sigma
+    higher_prob = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+    if sample_size >= 8 and std_dev and std_dev > 0:
+        cap = 0.68
+    elif sample_size >= 3:
+        cap = 0.62
+    else:
+        cap = 0.58
+
+    lower_bound = max(0.32, 1.0 - cap)
+    return max(lower_bound, min(cap, higher_prob))
+
+
+def _projection_source_for_prop(prop: dict) -> str:
+    if prop.get("_projectionSource"):
+        return prop["_projectionSource"]
+    sport_key = (prop.get("_sport_key") or prop.get("sport") or "").lower()
+    if sport_key in ("wnba", "nba", "nfl", "nhl", "soccer", "mma"):
+        return "sportradar_recent_stats"
+    if sport_key == "mlb":
+        return "mlb_stats_recent_stats"
+    return "recent_stats"
+
+
+def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
+    stats = prop.get("_playerStats") or {}
+    season_avg = _safe_float(stats.get("seasonAvg"))
+    last5 = _clean_numbers(stats.get("last5", []))
+    last10 = _clean_numbers(stats.get("last10", []))
+    line = _safe_float(prop.get("line"))
+    sport_key = prop.get("_sport_key") or prop.get("sport") or ""
+    stat_display = prop.get("stat_display", prop.get("stat_type", ""))
+
+    buckets: list[tuple[float, float]] = []
+    last5_avg = _mean(last5)
+    last10_avg = _mean(last10)
+    if last5_avg is not None:
+        buckets.append((0.45, last5_avg))
+    if last10_avg is not None:
+        buckets.append((0.35, last10_avg))
+    if season_avg is not None:
+        buckets.append((0.20, season_avg))
+
+    if line is None or not buckets:
+        return {
+            "projection": None,
+            "projectionEdge": None,
+            "projectionSource": None,
+            "probabilitySource": "fallback_model" if scored and scored.get("modelProb") is not None else None,
+            "confidence": None,
+            "sampleSize": max(len(last10), len(last5), 0),
+            "recentAverage": None,
+            "recentStdDev": None,
+            "projectionAvailable": False,
+        }
+
+    total_weight = sum(weight for weight, _ in buckets)
+    projection = sum(weight * value for weight, value in buckets) / total_weight
+    recent_values = last10 or last5
+    sample_size = len(recent_values)
+    recent_average = _mean(recent_values)
+    recent_std_dev = _std_dev(recent_values)
+    projected_higher_prob = estimate_probability_from_projection(
+        projection, line, recent_std_dev, sample_size, sport_key, stat_display
+    )
+
+    if sample_size >= 10 and recent_std_dev is not None:
+        confidence = 0.62
+    elif sample_size >= 5:
+        confidence = 0.56
+    elif sample_size >= 3:
+        confidence = 0.50
+    else:
+        confidence = 0.42
+
+    selected_side = (scored or {}).get("selectedSide") or prop.get("side") or ""
+    selected_side = str(selected_side).lower()
+    projection_probability = (
+        1.0 - projected_higher_prob if selected_side == "lower" else projected_higher_prob
+    )
+
+    return {
+        "projection": round(projection, 2),
+        "projectionEdge": round(projection - line, 2),
+        "projectionSource": _projection_source_for_prop(prop),
+        "probabilitySource": "projection_estimator",
+        "projectionProbability": round(projection_probability * 100, 1),
+        "confidence": round(confidence, 2),
+        "sampleSize": sample_size,
+        "recentAverage": round(recent_average, 2) if recent_average is not None else None,
+        "recentStdDev": round(recent_std_dev, 2) if recent_std_dev is not None else None,
+        "projectionAvailable": True,
+    }
+
+
 def _poisson_prob_higher(lambda_val: float, line: float) -> float:
     """
     P(X >= line + epsilon) for a Poisson distributed stat with mean lambda_val.
@@ -701,14 +867,37 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
     """Score a batch of enriched props and separate into picks and passes."""
     picks = []
     passes = []
+    projection_health = {
+        "enabled": True,
+        "sport": (props[0].get("_sport_key") or props[0].get("sport") or "") if props else "",
+        "propsReceived": len(props),
+        "projectionAttempted": len(props),
+        "projectionMatched": 0,
+        "projectionUnavailable": 0,
+        "provider": None,
+        "errors": [],
+    }
 
     for prop in props:
         scored = score_prop(prop)
         if scored is None:
-            passes.append({**prop, "verdict": "SKIP", "reason": "Insufficient data"})
+            projection = build_projection_metadata(prop)
+            if projection.get("projectionAvailable"):
+                projection_health["projectionMatched"] += 1
+                projection_health["provider"] = projection_health["provider"] or projection.get("projectionSource")
+            else:
+                projection_health["projectionUnavailable"] += 1
+            passes.append({**prop, **projection, "verdict": "SKIP", "reason": "Insufficient data"})
             continue
 
-        result = {**prop, **scored}
+        projection = build_projection_metadata(prop, scored)
+        if projection.get("projectionAvailable"):
+            projection_health["projectionMatched"] += 1
+            projection_health["provider"] = projection_health["provider"] or projection.get("projectionSource")
+        else:
+            projection_health["projectionUnavailable"] += 1
+
+        result = {**prop, **projection, **scored}
         composite = _compute_composite_ev(result)
         result.update(composite)
 
@@ -724,6 +913,7 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
         "picks": picks,
         "passes": passes,
         "stats_context": f"Scored {len(props)} props: {len(picks)} actionable, {len(passes)} passed",
+        "projectionHealth": projection_health,
     }
 
 

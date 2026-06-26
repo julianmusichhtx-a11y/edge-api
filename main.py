@@ -9,6 +9,7 @@ import inspect
 from adapters import get_adapter
 from scoring.scorer import score_props
 from cache.cache_manager import get, put
+from config import SPORTRADAR_API_KEY, SPORTSDATAIO_API_KEY
 
 app = FastAPI(title="EdgeLab Prediction API")
 
@@ -46,9 +47,21 @@ class PredictRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "prediction-api"}
+    return {
+        "status": "ok",
+        "service": "prediction-api",
+        "providers": {
+            "sportradarConfigured": bool(SPORTRADAR_API_KEY),
+            "sportsDataIoConfigured": bool(SPORTSDATAIO_API_KEY),
+        },
+        "projections": {
+            "enabled": True,
+            "supportedSports": ["mlb", "wnba", "soccer"],
+        },
+    }
 
 
+@app.post("/analyze")
 @app.post("/predict")
 async def predict(request: PredictRequest):
     try:
@@ -56,7 +69,11 @@ async def predict(request: PredictRequest):
         if not adapter:
             raise HTTPException(status_code=400, detail=f"Unsupported sport: {request.sport}")
 
-        raw_props = [p.dict() for p in request.props]
+        raw_props = []
+        for p in request.props:
+            raw = p.dict()
+            raw.setdefault("sport", request.sport.lower())
+            raw_props.append(raw)
         enrichment_errors = []
 
         try:
@@ -90,10 +107,22 @@ async def predict(request: PredictRequest):
 
         # Score the enriched props
         scored_result = score_props(enriched_props, min_edge=request.min_edge)
+        projection_health = scored_result.get("projectionHealth", {
+            "enabled": True,
+            "sport": request.sport.lower(),
+            "propsReceived": len(request.props),
+            "projectionAttempted": len(enriched_props),
+            "projectionMatched": 0,
+            "projectionUnavailable": len(enriched_props),
+            "provider": None,
+            "errors": [],
+        })
+        projection_health["sport"] = projection_health.get("sport") or request.sport.lower()
 
         return {
             "picks": scored_result.get("picks", []),
             "passes": scored_result.get("passes", []),
+            "projectionHealth": projection_health,
             "stats_context": scored_result.get("stats_context", ""),
             "errors": enrichment_errors,
             "summary": {
