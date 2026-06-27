@@ -20,6 +20,8 @@ Calibration notes (June 2026):
     either direction, we pull it 35% back toward market. This is a safety
     valve for cases where our model over- or under-reacts to small samples.
 """
+from __future__ import annotations
+
 import math
 from utils.odds_math import american_to_implied, classify_volatility, calculate_edge, devig_sharp_line, kelly_criterion, calculate_true_edge, kelly_criterion
 
@@ -139,6 +141,7 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
         buckets.append((0.20, season_avg))
 
     if line is None or not buckets:
+        reason = prop.get("_projectionUnavailableReason")
         return {
             "projection": None,
             "projectionEdge": None,
@@ -149,6 +152,7 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
             "recentAverage": None,
             "recentStdDev": None,
             "projectionAvailable": False,
+            "projectionUnavailableReason": reason,
         }
 
     total_weight = sum(weight for weight, _ in buckets)
@@ -188,6 +192,32 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
         "recentStdDev": round(recent_std_dev, 2) if recent_std_dev is not None else None,
         "projectionAvailable": True,
     }
+
+
+def _projection_failure_sample(prop: dict, reason: str) -> dict:
+    return {
+        "player": prop.get("player_name") or prop.get("player") or "",
+        "stat": prop.get("stat_display") or prop.get("stat_type") or "",
+        "line": prop.get("line"),
+        "side": prop.get("side") or prop.get("selectedSide") or "",
+        "reason": reason,
+    }
+
+
+def _record_projection_health(projection_health: dict, prop: dict, projection: dict):
+    if projection.get("projectionAvailable"):
+        projection_health["projectionMatched"] += 1
+        projection_health["provider"] = projection_health["provider"] or "railway_prediction_api"
+        return
+
+    projection_health["projectionUnavailable"] += 1
+    reason = projection.get("projectionUnavailableReason") or prop.get("_projectionUnavailableReason") or "no_stat_history"
+    reason_counts = projection_health["unavailableReasons"]
+    if reason not in reason_counts:
+        reason = "projection_exception"
+    reason_counts[reason] += 1
+    if len(projection_health["sampleFailures"]) < 10:
+        projection_health["sampleFailures"].append(_projection_failure_sample(prop, reason))
 
 
 def _poisson_prob_higher(lambda_val: float, line: float) -> float:
@@ -874,28 +904,49 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
         "projectionAttempted": len(props),
         "projectionMatched": 0,
         "projectionUnavailable": 0,
-        "provider": None,
+        "provider": "railway_prediction_api",
+        "unavailableReasons": {
+            "player_not_matched": 0,
+            "stat_not_supported": 0,
+            "no_game_logs": 0,
+            "no_season_stats": 0,
+            "no_stat_history": 0,
+            "projection_exception": 0,
+        },
+        "sampleFailures": [],
         "errors": [],
     }
 
     for prop in props:
         scored = score_prop(prop)
         if scored is None:
-            projection = build_projection_metadata(prop)
-            if projection.get("projectionAvailable"):
-                projection_health["projectionMatched"] += 1
-                projection_health["provider"] = projection_health["provider"] or projection.get("projectionSource")
-            else:
-                projection_health["projectionUnavailable"] += 1
+            try:
+                projection = build_projection_metadata(prop)
+            except Exception as e:
+                projection = {
+                    "projection": None,
+                    "projectionEdge": None,
+                    "projectionSource": None,
+                    "projectionAvailable": False,
+                    "projectionUnavailableReason": "projection_exception",
+                }
+                projection_health["errors"].append({"error": str(e)})
+            _record_projection_health(projection_health, prop, projection)
             passes.append({**prop, **projection, "verdict": "SKIP", "reason": "Insufficient data"})
             continue
 
-        projection = build_projection_metadata(prop, scored)
-        if projection.get("projectionAvailable"):
-            projection_health["projectionMatched"] += 1
-            projection_health["provider"] = projection_health["provider"] or projection.get("projectionSource")
-        else:
-            projection_health["projectionUnavailable"] += 1
+        try:
+            projection = build_projection_metadata(prop, scored)
+        except Exception as e:
+            projection = {
+                "projection": None,
+                "projectionEdge": None,
+                "projectionSource": None,
+                "projectionAvailable": False,
+                "projectionUnavailableReason": "projection_exception",
+            }
+            projection_health["errors"].append({"error": str(e)})
+        _record_projection_health(projection_health, prop, projection)
 
         result = {**prop, **projection, **scored}
         composite = _compute_composite_ev(result)

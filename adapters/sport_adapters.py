@@ -7,25 +7,64 @@ fetching) is handled by SportradarAdapter.
 from adapters.sportradar_base import SportradarAdapter
 
 
+def _stat_int(stats: dict, *keys: str) -> int:
+    for key in keys:
+        value = stats.get(key)
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 class WNBAAdapter(SportradarAdapter):
     sport_key = "wnba"
     sport_label = "WNBA"
     LOOKBACK_DAYS = 7
 
+    STAT_ALIASES = {
+        "points": "points",
+        "pts": "points",
+        "rebounds": "rebounds",
+        "rebs": "rebounds",
+        "total_rebounds": "rebounds",
+        "assists": "assists",
+        "asts": "assists",
+        "three_pointers_made": "three_pointers_made",
+        "three_points_made": "three_pointers_made",
+        "three_pointers": "three_pointers_made",
+        "3pt_made": "three_pointers_made",
+        "3_pointers_made": "three_pointers_made",
+        "threes": "three_pointers_made",
+        "made_threes": "three_pointers_made",
+        "points_rebounds_assists": "points_rebounds_assists",
+        "pts_rebs_asts": "points_rebounds_assists",
+        "pra": "points_rebounds_assists",
+        "points_rebounds": "points_rebounds",
+        "pts_rebs": "points_rebounds",
+        "points_assists": "points_assists",
+        "pts_asts": "points_assists",
+        "rebounds_assists": "rebounds_assists",
+        "rebs_asts": "rebounds_assists",
+    }
+
     STAT_EXTRACTORS = {
-        "points":             lambda s: int(s.get("points", 0)),
-        "rebounds":           lambda s: int(s.get("rebounds", s.get("total_rebounds", 0))),
-        "assists":            lambda s: int(s.get("assists", 0)),
-        "three_pointers":     lambda s: int(s.get("three_points_made", 0)),
-        "steals":             lambda s: int(s.get("steals", 0)),
-        "blocks":             lambda s: int(s.get("blocks", 0)),
-        "turnovers":          lambda s: int(s.get("turnovers", 0)),
-        "offensive_rebounds": lambda s: int(s.get("offensive_rebounds", s.get("off_rebounds", 0))),
-        "pra":                lambda s: int(s.get("points", 0)) + int(s.get("rebounds", s.get("total_rebounds", 0))) + int(s.get("assists", 0)),
-        "points_rebounds":    lambda s: int(s.get("points", 0)) + int(s.get("rebounds", s.get("total_rebounds", 0))),
-        "points_assists":     lambda s: int(s.get("points", 0)) + int(s.get("assists", 0)),
-        "rebounds_assists":   lambda s: int(s.get("rebounds", s.get("total_rebounds", 0))) + int(s.get("assists", 0)),
-        "blocks_steals":      lambda s: int(s.get("blocks", 0)) + int(s.get("steals", 0)),
+        "points":                    lambda s: _stat_int(s, "points"),
+        "rebounds":                  lambda s: _stat_int(s, "rebounds", "total_rebounds"),
+        "assists":                   lambda s: _stat_int(s, "assists"),
+        "three_pointers":            lambda s: _stat_int(s, "three_points_made", "three_pointers_made"),
+        "three_pointers_made":       lambda s: _stat_int(s, "three_points_made", "three_pointers_made"),
+        "steals":                    lambda s: _stat_int(s, "steals"),
+        "blocks":                    lambda s: _stat_int(s, "blocks"),
+        "turnovers":                 lambda s: _stat_int(s, "turnovers"),
+        "offensive_rebounds":        lambda s: _stat_int(s, "offensive_rebounds", "off_rebounds"),
+        "pra":                       lambda s: _stat_int(s, "points") + _stat_int(s, "rebounds", "total_rebounds") + _stat_int(s, "assists"),
+        "points_rebounds_assists":   lambda s: _stat_int(s, "points") + _stat_int(s, "rebounds", "total_rebounds") + _stat_int(s, "assists"),
+        "points_rebounds":           lambda s: _stat_int(s, "points") + _stat_int(s, "rebounds", "total_rebounds"),
+        "points_assists":            lambda s: _stat_int(s, "points") + _stat_int(s, "assists"),
+        "rebounds_assists":          lambda s: _stat_int(s, "rebounds", "total_rebounds") + _stat_int(s, "assists"),
+        "blocks_steals":             lambda s: _stat_int(s, "blocks") + _stat_int(s, "steals"),
     }
 
 

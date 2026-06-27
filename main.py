@@ -114,7 +114,16 @@ async def predict(request: PredictRequest):
             "projectionAttempted": len(enriched_props),
             "projectionMatched": 0,
             "projectionUnavailable": len(enriched_props),
-            "provider": None,
+            "provider": "railway_prediction_api",
+            "unavailableReasons": {
+                "player_not_matched": 0,
+                "stat_not_supported": 0,
+                "no_game_logs": 0,
+                "no_season_stats": 0,
+                "no_stat_history": len(enriched_props),
+                "projection_exception": 0,
+            },
+            "sampleFailures": [],
             "errors": [],
         })
         projection_health["sport"] = projection_health.get("sport") or request.sport.lower()

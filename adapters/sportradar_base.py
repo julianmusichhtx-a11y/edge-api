@@ -5,7 +5,11 @@ and sport-specific field mappings.
 
 Rate-limited to 1 req/sec via the global rate limiter.
 """
+from __future__ import annotations
+
 import httpx
+import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -29,12 +33,80 @@ class SportradarAdapter(BaseSportAdapter):
     # Override in subclass
     STAT_EXTRACTORS: dict = {}
     SEASON_AVG_FIELDS: dict = {}
+    STAT_ALIASES: dict = {}
     LOOKBACK_DAYS: int = 7   # How many days of game history to fetch
 
     def __init__(self):
         self._client = httpx.AsyncClient(timeout=10.0)
         self._name_to_id: dict = {}
+        self._name_aliases: dict = {}
         self._player_game_log: dict = {}  # name → [game_stats_dict, ...]
+
+    def _normalize_player_name(self, name: str) -> str:
+        name = unicodedata.normalize("NFKD", name or "")
+        name = "".join(ch for ch in name if not unicodedata.combining(ch))
+        name = name.lower().strip()
+        name = re.sub(r"[^\w\s]", " ", name)
+        parts = [p for p in name.split() if p not in {"jr", "sr", "ii", "iii", "iv"}]
+        return " ".join(parts)
+
+    def _register_player(self, player: dict):
+        names = [
+            player.get("full_name"),
+            player.get("name"),
+            player.get("display_name"),
+            player.get("preferred_name"),
+        ]
+        if player.get("first_name") and player.get("last_name"):
+            names.append(f"{player.get('first_name')} {player.get('last_name')}")
+
+        normalized_names = [self._normalize_player_name(n) for n in names if n]
+        normalized_names = [n for n in normalized_names if n]
+        if not normalized_names:
+            return None
+
+        canonical = normalized_names[0]
+        self._name_to_id.setdefault(canonical, {
+            "id": player.get("id"),
+            "position": player.get("position", ""),
+        })
+        for alias in normalized_names:
+            self._name_aliases.setdefault(alias, canonical)
+        return canonical
+
+    def _find_player_log(self, player_name: str) -> tuple[str | None, list, float | None]:
+        normalized = self._normalize_player_name(player_name)
+        if not normalized:
+            return None, [], None
+
+        if normalized in self._player_game_log:
+            return normalized, self._player_game_log.get(normalized, []), 0.98
+
+        alias = self._name_aliases.get(normalized)
+        if alias and alias in self._player_game_log:
+            return alias, self._player_game_log.get(alias, []), 0.94
+
+        parts = normalized.split()
+        if len(parts) >= 2:
+            first_initial = parts[0][0]
+            last_name = parts[-1]
+            candidates = []
+            for provider_name in self._player_game_log.keys():
+                provider_parts = provider_name.split()
+                if (
+                    len(provider_parts) >= 2
+                    and provider_parts[0].startswith(first_initial)
+                    and provider_parts[-1] == last_name
+                ):
+                    candidates.append(provider_name)
+            if len(candidates) == 1:
+                key = candidates[0]
+                return key, self._player_game_log.get(key, []), 0.86
+
+        return None, [], None
+
+    def _mark_projection_unavailable(self, prop: dict, reason: str):
+        prop["_projectionUnavailableReason"] = reason
 
     def _build_url(self, path: str) -> str:
         """Build full Sportradar URL for this sport."""
@@ -138,24 +210,17 @@ class SportradarAdapter(BaseSportAdapter):
                 team_data = game_data.get(side, {})
                 players = team_data.get("players", [])
                 for p in players:
-                    name = (p.get("full_name") or p.get("name") or "").lower().strip()
-                    if not name:
+                    name_key = self._register_player(p)
+                    if not name_key:
                         continue
-
-                    # Expand name→ID map from game rosters
-                    if p.get("id") and name not in self._name_to_id:
-                        self._name_to_id[name] = {
-                            "id": p["id"],
-                            "position": p.get("position", ""),
-                        }
 
                     # Store game stats
                     stats = p.get("statistics", p.get("stats", {}))
                     if not stats:
                         continue
-                    if name not in self._player_game_log:
-                        self._player_game_log[name] = []
-                    self._player_game_log[name].append(stats)
+                    if name_key not in self._player_game_log:
+                        self._player_game_log[name_key] = []
+                    self._player_game_log[name_key].append(stats)
 
         print(f"[{self.sport_label}] Built game logs for {len(self._player_game_log)} players, "
               f"name_to_id has {len(self._name_to_id)} entries")
@@ -197,12 +262,7 @@ class SportradarAdapter(BaseSportAdapter):
 
             players = team_data.get("players", team_data.get("roster", []))
             for p in players:
-                name = (p.get("full_name") or p.get("name") or "").lower().strip()
-                if name and p.get("id") and name not in self._name_to_id:
-                    self._name_to_id[name] = {
-                        "id": p["id"],
-                        "position": p.get("position", ""),
-                    }
+                self._register_player(p)
 
     async def get_player_stats(
         self, player_name: str, stat_key: str, line: float,
@@ -210,8 +270,7 @@ class SportradarAdapter(BaseSportAdapter):
     ) -> Optional[PlayerStats]:
         await self._load_recent_game_logs()
 
-        name_lower = player_name.lower().strip()
-        game_log = self._player_game_log.get(name_lower, [])
+        name_key, game_log, _confidence = self._find_player_log(player_name)
 
         extractor = self.STAT_EXTRACTORS.get(stat_key)
         if not extractor:
@@ -235,7 +294,7 @@ class SportradarAdapter(BaseSportAdapter):
 
         return PlayerStats(
             player_name=player_name,
-            player_id=self._name_to_id.get(name_lower, {}).get("id"),
+            player_id=self._name_to_id.get(name_key or "", {}).get("id"),
             team=home_team or away_team,
             season_avg=season_avg,
             last5=last5,
@@ -250,26 +309,36 @@ class SportradarAdapter(BaseSportAdapter):
 
         enriched = 0
         for prop in props:
-            player_name = prop.get("player_name", "")
+            player_name = prop.get("player_name") or prop.get("player") or ""
             stat_display = prop.get("stat_display", prop.get("stat_type", ""))
             line = float(prop.get("line", 0))
+            prop["_sport_key"] = self.sport_key
 
             stat_key = self._resolve_stat_key(stat_display)
             if not stat_key:
+                self._mark_projection_unavailable(prop, "stat_not_supported")
                 continue
 
             # Period scaling for 1Q/1H/2H props
             period_mult = self._get_period_multiplier(stat_display)
 
-            name_lower = player_name.lower().strip()
-            game_log = self._player_game_log.get(name_lower, [])
+            name_key, game_log, match_confidence = self._find_player_log(player_name)
+            if not name_key:
+                reason = "no_game_logs" if not self._player_game_log else "player_not_matched"
+                self._mark_projection_unavailable(prop, reason)
+                continue
 
             extractor = self.STAT_EXTRACTORS.get(stat_key)
             if not extractor or len(game_log) < 3:
+                reason = "stat_not_supported" if not extractor else "no_stat_history"
+                self._mark_projection_unavailable(prop, reason)
                 continue
 
             last5 = [round(extractor(g) * period_mult, 1) for g in game_log[:5]]
             last10 = [round(extractor(g) * period_mult, 1) for g in game_log[:10]]
+            if len(last5) < 3:
+                self._mark_projection_unavailable(prop, "no_stat_history")
+                continue
             season_avg = sum(last10) / len(last10) if last10 else None
 
             prop["_playerStats"] = {
@@ -278,6 +347,8 @@ class SportradarAdapter(BaseSportAdapter):
                 "last10": last10 if len(last10) >= 3 else last5,
                 "last15": [],
             }
+            prop["_projectionSource"] = "sportradar_recent_stats"
+            prop["projectionMatchConfidence"] = match_confidence
             enriched += 1
 
         print(f"[{self.sport_label}] Enriched {enriched} of {len(props)} props")
@@ -286,7 +357,8 @@ class SportradarAdapter(BaseSportAdapter):
     def _resolve_stat_key(self, stat_display: str) -> str | None:
         """Map stat display string to canonical stat key."""
         from config import PROP_STAT_MAP
-        sd = stat_display.lower().strip()
+        sd = re.sub(r"[_-]+", " ", (stat_display or "").lower().strip())
+        compact_sd = sd.replace(" ", "_")
         # Remove period prefixes for matching
         for prefix in ["1q ", "2q ", "3q ", "4q ", "1h ", "2h ",
                         "first quarter ", "second quarter ",
@@ -296,10 +368,18 @@ class SportradarAdapter(BaseSportAdapter):
                         "1st inn. ", "1st inning "]:
             if sd.startswith(prefix):
                 sd = sd[len(prefix):]
+                compact_sd = sd.replace(" ", "_")
                 break
 
+        aliases = getattr(self, "STAT_ALIASES", {}) or {}
+        if compact_sd in aliases:
+            return aliases[compact_sd]
+        if sd in aliases:
+            return aliases[sd]
         if sd in PROP_STAT_MAP:
             return PROP_STAT_MAP[sd]
+        if compact_sd in PROP_STAT_MAP:
+            return PROP_STAT_MAP[compact_sd]
         for key in sorted(PROP_STAT_MAP.keys(), key=len, reverse=True):
             if key in sd or sd in key:
                 return PROP_STAT_MAP[key]
