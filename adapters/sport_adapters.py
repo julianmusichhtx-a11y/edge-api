@@ -7,12 +7,12 @@ fetching) is handled by SportradarAdapter.
 from adapters.sportradar_base import SportradarAdapter
 
 
-def _stat_int(stats: dict, *keys: str) -> int:
+def _stat_int(stats: dict, *keys: str) -> float:
     for key in keys:
         value = stats.get(key)
         if value not in (None, ""):
             try:
-                return int(value)
+                return float(value)
             except (TypeError, ValueError):
                 return 0
     return 0
@@ -47,6 +47,13 @@ class WNBAAdapter(SportradarAdapter):
         "pts_asts": "points_assists",
         "rebounds_assists": "rebounds_assists",
         "rebs_asts": "rebounds_assists",
+        "blocks": "blocks",
+        "steals": "steals",
+        "turnovers": "turnovers",
+        "fantasy_points": "fantasy_points",
+        "blocks_steals": "blocks_steals",
+        "blks_stls": "blocks_steals",
+        "blk_stl": "blocks_steals",
     }
 
     STAT_EXTRACTORS = {
@@ -58,6 +65,7 @@ class WNBAAdapter(SportradarAdapter):
         "steals":                    lambda s: _stat_int(s, "steals"),
         "blocks":                    lambda s: _stat_int(s, "blocks"),
         "turnovers":                 lambda s: _stat_int(s, "turnovers"),
+        "fantasy_points":            lambda s: _stat_int(s, "fantasy_points", "fantasy_pts", "dfs_points"),
         "offensive_rebounds":        lambda s: _stat_int(s, "offensive_rebounds", "off_rebounds"),
         "pra":                       lambda s: _stat_int(s, "points") + _stat_int(s, "rebounds", "total_rebounds") + _stat_int(s, "assists"),
         "points_rebounds_assists":   lambda s: _stat_int(s, "points") + _stat_int(s, "rebounds", "total_rebounds") + _stat_int(s, "assists"),

@@ -126,6 +126,7 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
     season_avg = _safe_float(stats.get("seasonAvg"))
     last5 = _clean_numbers(stats.get("last5", []))
     last10 = _clean_numbers(stats.get("last10", []))
+    games_played = int(_safe_float(stats.get("gamesPlayed") or stats.get("games_played")) or 0)
     line = _safe_float(prop.get("line"))
     sport_key = prop.get("_sport_key") or prop.get("sport") or ""
     stat_display = prop.get("stat_display", prop.get("stat_type", ""))
@@ -158,14 +159,16 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
     total_weight = sum(weight for weight, _ in buckets)
     projection = sum(weight * value for weight, value in buckets) / total_weight
     recent_values = last10 or last5
-    sample_size = len(recent_values)
+    sample_size = len(recent_values) or games_played
     recent_average = _mean(recent_values)
     recent_std_dev = _std_dev(recent_values)
     projected_higher_prob = estimate_probability_from_projection(
         projection, line, recent_std_dev, sample_size, sport_key, stat_display
     )
 
-    if sample_size >= 10 and recent_std_dev is not None:
+    if not recent_values and season_avg is not None:
+        confidence = 0.45
+    elif sample_size >= 10 and recent_std_dev is not None:
         confidence = 0.62
     elif sample_size >= 5:
         confidence = 0.56

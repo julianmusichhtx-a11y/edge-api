@@ -41,6 +41,7 @@ class SportradarAdapter(BaseSportAdapter):
         self._name_to_id: dict = {}
         self._name_aliases: dict = {}
         self._player_game_log: dict = {}  # name → [game_stats_dict, ...]
+        self._player_season_stats: dict = {}
 
     def _normalize_player_name(self, name: str) -> str:
         name = unicodedata.normalize("NFKD", name or "")
@@ -79,11 +80,11 @@ class SportradarAdapter(BaseSportAdapter):
         if not normalized:
             return None, [], None
 
-        if normalized in self._player_game_log:
+        if normalized in self._player_game_log or normalized in self._player_season_stats:
             return normalized, self._player_game_log.get(normalized, []), 0.98
 
         alias = self._name_aliases.get(normalized)
-        if alias and alias in self._player_game_log:
+        if alias and (alias in self._player_game_log or alias in self._player_season_stats):
             return alias, self._player_game_log.get(alias, []), 0.94
 
         parts = normalized.split()
@@ -91,7 +92,8 @@ class SportradarAdapter(BaseSportAdapter):
             first_initial = parts[0][0]
             last_name = parts[-1]
             candidates = []
-            for provider_name in self._player_game_log.keys():
+            provider_names = set(self._player_game_log.keys()) | set(self._player_season_stats.keys())
+            for provider_name in provider_names:
                 provider_parts = provider_name.split()
                 if (
                     len(provider_parts) >= 2
@@ -107,6 +109,26 @@ class SportradarAdapter(BaseSportAdapter):
 
     def _mark_projection_unavailable(self, prop: dict, reason: str):
         prop["_projectionUnavailableReason"] = reason
+
+    def _extract_stats_payload(self, player: dict) -> dict:
+        stats = player.get("statistics") or player.get("stats") or {}
+        if isinstance(stats, dict) and stats:
+            return stats
+        for key in ("season", "season_stats", "season_average", "average", "average_statistics"):
+            value = player.get(key)
+            if isinstance(value, dict) and value:
+                return value
+        return {}
+
+    def _season_games_played(self, stats: dict) -> int:
+        for key in ("games_played", "games", "played"):
+            try:
+                games = int(stats.get(key))
+                if games > 0:
+                    return games
+            except (TypeError, ValueError):
+                continue
+        return 0
 
     def _build_url(self, path: str) -> str:
         """Build full Sportradar URL for this sport."""
@@ -215,12 +237,13 @@ class SportradarAdapter(BaseSportAdapter):
                         continue
 
                     # Store game stats
-                    stats = p.get("statistics", p.get("stats", {}))
+                    stats = self._extract_stats_payload(p)
                     if not stats:
                         continue
                     if name_key not in self._player_game_log:
                         self._player_game_log[name_key] = []
                     self._player_game_log[name_key].append(stats)
+                    self._player_season_stats.setdefault(name_key, stats)
 
         print(f"[{self.sport_label}] Built game logs for {len(self._player_game_log)} players, "
               f"name_to_id has {len(self._name_to_id)} entries")
@@ -262,7 +285,10 @@ class SportradarAdapter(BaseSportAdapter):
 
             players = team_data.get("players", team_data.get("roster", []))
             for p in players:
-                self._register_player(p)
+                name_key = self._register_player(p)
+                stats = self._extract_stats_payload(p)
+                if name_key and stats:
+                    self._player_season_stats.setdefault(name_key, stats)
 
     async def get_player_stats(
         self, player_name: str, stat_key: str, line: float,
@@ -314,6 +340,10 @@ class SportradarAdapter(BaseSportAdapter):
             line = float(prop.get("line", 0))
             prop["_sport_key"] = self.sport_key
 
+            if self.sport_key == "wnba" and self._has_period_prefix(stat_display):
+                self._mark_projection_unavailable(prop, "stat_not_supported")
+                continue
+
             stat_key = self._resolve_stat_key(stat_display)
             if not stat_key:
                 self._mark_projection_unavailable(prop, "stat_not_supported")
@@ -329,23 +359,32 @@ class SportradarAdapter(BaseSportAdapter):
                 continue
 
             extractor = self.STAT_EXTRACTORS.get(stat_key)
-            if not extractor or len(game_log) < 3:
-                reason = "stat_not_supported" if not extractor else "no_stat_history"
+            if not extractor:
+                self._mark_projection_unavailable(prop, "stat_not_supported")
+                continue
+
+            season_stats = self._player_season_stats.get(name_key, {})
+            if len(game_log) < 3 and not season_stats:
+                reason = "no_game_logs" if not game_log else "no_stat_history"
                 self._mark_projection_unavailable(prop, reason)
                 continue
 
             last5 = [round(extractor(g) * period_mult, 1) for g in game_log[:5]]
             last10 = [round(extractor(g) * period_mult, 1) for g in game_log[:10]]
-            if len(last5) < 3:
+            season_avg = sum(last10) / len(last10) if last10 else None
+            if season_avg is None and season_stats:
+                season_avg = extractor(season_stats)
+
+            if len(last5) < 3 and season_avg is None:
                 self._mark_projection_unavailable(prop, "no_stat_history")
                 continue
-            season_avg = sum(last10) / len(last10) if last10 else None
 
             prop["_playerStats"] = {
                 "seasonAvg": round(season_avg, 2) if season_avg else None,
                 "last5": last5,
                 "last10": last10 if len(last10) >= 3 else last5,
                 "last15": [],
+                "gamesPlayed": len(game_log) if game_log else self._season_games_played(season_stats),
             }
             prop["_projectionSource"] = "sportradar_recent_stats"
             prop["projectionMatchConfidence"] = match_confidence
@@ -384,6 +423,16 @@ class SportradarAdapter(BaseSportAdapter):
             if key in sd or sd in key:
                 return PROP_STAT_MAP[key]
         return None
+
+    def _has_period_prefix(self, stat_display: str) -> bool:
+        sd = re.sub(r"[_-]+", " ", (stat_display or "").lower().strip())
+        return any(sd.startswith(prefix) for prefix in [
+            "1q ", "2q ", "3q ", "4q ", "1h ", "2h ",
+            "first quarter ", "second quarter ", "third quarter ", "fourth quarter ",
+            "first half ", "second half ",
+            "1st quarter ", "2nd quarter ", "3rd quarter ", "4th quarter ",
+            "1st half ", "2nd half ",
+        ])
 
     def _get_period_multiplier(self, stat_display: str) -> float:
         """Scale full-game stats for period-specific props."""
