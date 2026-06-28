@@ -152,8 +152,13 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
             "sampleSize": max(len(last10), len(last5), 0),
             "recentAverage": None,
             "recentStdDev": None,
+            "seasonAverage": season_avg,
+            "hitRateL5": None,
+            "hitRateL10": None,
+            "playerMatchConfidence": prop.get("_playerMatchConfidence"),
             "projectionAvailable": False,
             "projectionUnavailableReason": reason,
+            "unavailableReason": reason,
         }
 
     total_weight = sum(weight for weight, _ in buckets)
@@ -193,6 +198,11 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
         "sampleSize": sample_size,
         "recentAverage": round(recent_average, 2) if recent_average is not None else None,
         "recentStdDev": round(recent_std_dev, 2) if recent_std_dev is not None else None,
+        "seasonAverage": round(season_avg, 2) if season_avg is not None else None,
+        "hitRateL5": prop.get("hitRateL5"),
+        "hitRateL10": prop.get("hitRateL10"),
+        "playerMatchConfidence": prop.get("_playerMatchConfidence"),
+        "unavailableReason": None,
         "projectionAvailable": True,
     }
 
@@ -932,6 +942,7 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
                     "projectionSource": None,
                     "projectionAvailable": False,
                     "projectionUnavailableReason": "projection_exception",
+                    "unavailableReason": "projection_exception",
                 }
                 projection_health["errors"].append({"error": str(e)})
             _record_projection_health(projection_health, prop, projection)
@@ -947,6 +958,7 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
                 "projectionSource": None,
                 "projectionAvailable": False,
                 "projectionUnavailableReason": "projection_exception",
+                "unavailableReason": "projection_exception",
             }
             projection_health["errors"].append({"error": str(e)})
         _record_projection_health(projection_health, prop, projection)

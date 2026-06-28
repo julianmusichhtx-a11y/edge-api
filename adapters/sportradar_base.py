@@ -388,6 +388,7 @@ class SportradarAdapter(BaseSportAdapter):
             }
             prop["_projectionSource"] = "sportradar_recent_stats"
             prop["projectionMatchConfidence"] = match_confidence
+            prop["_playerMatchConfidence"] = match_confidence
             enriched += 1
 
         print(f"[{self.sport_label}] Enriched {enriched} of {len(props)} props")

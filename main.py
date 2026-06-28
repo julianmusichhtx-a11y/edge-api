@@ -11,6 +11,71 @@ from scoring.scorer import score_props
 from cache.cache_manager import get, put
 from config import SPORTRADAR_API_KEY, SPORTSDATAIO_API_KEY
 
+BACKEND_VERSION = "railway-contract-v1"
+
+SUPPORTED_SPORTS = {
+    "mlb": {
+        "status": "stable",
+        "projectionSupported": True,
+        "predictionSupported": True,
+        "pitcherStatsSupported": True,
+        "batterStatsSupported": True,
+    },
+    "soccer": {
+        "status": "beta",
+        "projectionSupported": True,
+        "predictionSupported": True,
+    },
+    "wnba": {
+        "status": "beta",
+        "projectionSupported": True,
+        "predictionSupported": True,
+        "supportedStats": ["points", "rebounds", "assists", "three_pointers", "pra"],
+    },
+}
+
+
+def _sport_support(sport: str) -> dict:
+    key = (sport or "").lower()
+    return SUPPORTED_SPORTS.get(key, {
+        "status": "unsupported",
+        "projectionSupported": False,
+        "predictionSupported": False,
+        "unsupportedReason": f"{sport or 'unknown'} is not supported by this backend contract",
+    })
+
+
+def _default_projection_health(sport: str, props_received: int = 0, attempted: int = 0) -> dict:
+    return {
+        "enabled": True,
+        "sport": (sport or "").lower(),
+        "propsReceived": props_received,
+        "projectionAttempted": attempted,
+        "projectionMatched": 0,
+        "projectionUnavailable": attempted,
+        "provider": "railway_prediction_api",
+        "unavailableReasons": {
+            "player_not_matched": 0,
+            "stat_not_supported": 0,
+            "no_game_logs": 0,
+            "no_season_stats": 0,
+            "no_stat_history": attempted,
+            "projection_exception": 0,
+        },
+        "sampleFailures": [],
+        "errors": [],
+    }
+
+
+def _limited_errors(errors: list) -> list:
+    safe = []
+    for item in errors[:10]:
+        if isinstance(item, dict):
+            safe.append({k: v for k, v in item.items() if "key" not in str(k).lower() and "token" not in str(k).lower() and "secret" not in str(k).lower()})
+        else:
+            safe.append({"error": str(item)})
+    return safe
+
 app = FastAPI(title="EdgeLab Prediction API")
 
 app.add_middleware(
@@ -50,13 +115,26 @@ async def health():
     return {
         "status": "ok",
         "service": "prediction-api",
+        "backendVersion": BACKEND_VERSION,
+        "supportedSports": list(SUPPORTED_SPORTS.keys()),
+        "configuredProviders": {
+            "sportradar": bool(SPORTRADAR_API_KEY),
+            "sportsDataIo": bool(SPORTSDATAIO_API_KEY),
+            "mlbStatsApi": True,
+        },
+        "projectionEnabled": True,
+        "providerReadiness": {
+            "sportradar": "ready" if SPORTRADAR_API_KEY else "not_configured",
+            "sportsDataIo": "ready" if SPORTSDATAIO_API_KEY else "not_configured",
+            "mlbStatsApi": "ready",
+        },
         "providers": {
             "sportradarConfigured": bool(SPORTRADAR_API_KEY),
             "sportsDataIoConfigured": bool(SPORTSDATAIO_API_KEY),
         },
         "projections": {
             "enabled": True,
-            "supportedSports": ["mlb", "wnba", "soccer"],
+            "supportedSports": list(SUPPORTED_SPORTS.keys()),
         },
     }
 
@@ -67,7 +145,56 @@ async def predict(request: PredictRequest):
     try:
         adapter = get_adapter(request.sport)
         if not adapter:
-            raise HTTPException(status_code=400, detail=f"Unsupported sport: {request.sport}")
+            projection_health = _default_projection_health(request.sport, len(request.props), 0)
+            projection_health["enabled"] = False
+            projection_health["unavailableReasons"]["stat_not_supported"] = len(request.props)
+            projection_health["backendVersion"] = BACKEND_VERSION
+            return {
+                "picks": [],
+                "passes": [
+                    {
+                        **p.dict(),
+                        "projectionAvailable": False,
+                        "projection": None,
+                        "projectionEdge": None,
+                        "projectionSource": None,
+                        "probabilitySource": None,
+                        "confidence": None,
+                        "sampleSize": None,
+                        "unavailableReason": "sport_not_supported",
+                        "projectionUnavailableReason": "sport_not_supported",
+                        "verdict": "SKIP",
+                        "reason": f"Unsupported sport: {request.sport}",
+                    }
+                    for p in request.props[:50]
+                ],
+                "projectionHealth": projection_health,
+                "projectionAttempted": 0,
+                "projectionMatched": 0,
+                "projectionUnavailable": len(request.props),
+                "unavailableReasons": {"sport_not_supported": len(request.props)},
+                "sampleFailures": [
+                    {
+                        "player": p.player_name,
+                        "stat": p.stat_display,
+                        "line": p.line,
+                        "side": "",
+                        "reason": "sport_not_supported",
+                    }
+                    for p in request.props[:10]
+                ],
+                "providerErrors": [],
+                "sportSupport": _sport_support(request.sport),
+                "backendVersion": BACKEND_VERSION,
+                "stats_context": f"Unsupported sport: {request.sport}",
+                "errors": [],
+                "summary": {
+                    "actionable_picks": 0,
+                    "passes": len(request.props),
+                    "enriched": 0,
+                    "total": len(request.props)
+                }
+            }
 
         raw_props = []
         for p in request.props:
@@ -92,9 +219,19 @@ async def predict(request: PredictRequest):
             enriched_props = raw_props  # fall back to unenriched props rather than failing the whole request
 
         if not enriched_props:
+            projection_health = _default_projection_health(request.sport, len(request.props), 0)
             return {
                 "picks": [],
                 "passes": [],
+                "projectionHealth": projection_health,
+                "projectionAttempted": 0,
+                "projectionMatched": 0,
+                "projectionUnavailable": 0,
+                "unavailableReasons": projection_health["unavailableReasons"],
+                "sampleFailures": [],
+                "providerErrors": _limited_errors(enrichment_errors),
+                "sportSupport": _sport_support(request.sport),
+                "backendVersion": BACKEND_VERSION,
                 "stats_context": "",
                 "errors": enrichment_errors,
                 "summary": {
@@ -107,31 +244,26 @@ async def predict(request: PredictRequest):
 
         # Score the enriched props
         scored_result = score_props(enriched_props, min_edge=request.min_edge)
-        projection_health = scored_result.get("projectionHealth", {
-            "enabled": True,
-            "sport": request.sport.lower(),
-            "propsReceived": len(request.props),
-            "projectionAttempted": len(enriched_props),
-            "projectionMatched": 0,
-            "projectionUnavailable": len(enriched_props),
-            "provider": "railway_prediction_api",
-            "unavailableReasons": {
-                "player_not_matched": 0,
-                "stat_not_supported": 0,
-                "no_game_logs": 0,
-                "no_season_stats": 0,
-                "no_stat_history": len(enriched_props),
-                "projection_exception": 0,
-            },
-            "sampleFailures": [],
-            "errors": [],
-        })
+        projection_health = scored_result.get("projectionHealth") or _default_projection_health(
+            request.sport,
+            len(request.props),
+            len(enriched_props),
+        )
         projection_health["sport"] = projection_health.get("sport") or request.sport.lower()
+        projection_health["backendVersion"] = BACKEND_VERSION
 
         return {
             "picks": scored_result.get("picks", []),
             "passes": scored_result.get("passes", []),
             "projectionHealth": projection_health,
+            "projectionAttempted": projection_health.get("projectionAttempted", 0),
+            "projectionMatched": projection_health.get("projectionMatched", 0),
+            "projectionUnavailable": projection_health.get("projectionUnavailable", 0),
+            "unavailableReasons": projection_health.get("unavailableReasons", {}),
+            "sampleFailures": projection_health.get("sampleFailures", [])[:10],
+            "providerErrors": _limited_errors(enrichment_errors + projection_health.get("errors", [])),
+            "sportSupport": _sport_support(request.sport),
+            "backendVersion": BACKEND_VERSION,
             "stats_context": scored_result.get("stats_context", ""),
             "errors": enrichment_errors,
             "summary": {
