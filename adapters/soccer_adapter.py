@@ -58,9 +58,12 @@ class SoccerAdapter(BaseSportAdapter):
             int(s.get("shots_off_target", 0)) +
             int(s.get("shots_blocked", 0))
         ),
+        "goalkeeper_saves":  lambda s: int(s.get("saves", s.get("goalkeeper_saves", 0))),
         "goals_allowed":    lambda s: int(s.get("goals_conceded", s.get("goals_against", 0))),
         "tackles":          lambda s: int(s.get("tackles", 0)),
         "passes":           lambda s: int(s.get("passes", 0)),
+        "fouls_committed":   lambda s: int(s.get("fouls_committed", s.get("fouls", 0))),
+        "fouls_drawn":       lambda s: int(s.get("fouls_drawn", s.get("fouls_suffered", 0))),
         "yellow_cards":     lambda s: int(s.get("yellow_cards", 0)),
         "corner_kicks":     lambda s: int(s.get("corner_kicks", 0)),
         "offsides":         lambda s: int(s.get("offsides", 0)),
@@ -246,8 +249,11 @@ class SoccerAdapter(BaseSportAdapter):
             "goals + assists": "goals_assists", "goals+assists": "goals_assists",
             "shots on target": "shots_on_target", "shots on goal": "shots_on_target",
             "shots attempted": "shots", "shots": "shots", "total shots": "shots",
+            "saves": "goalkeeper_saves", "goalkeeper saves": "goalkeeper_saves",
             "tackles": "tackles",
-            "passes": "passes",
+            "passes": "passes", "passes attempted": "passes",
+            "fouls": "fouls_committed", "fouls committed": "fouls_committed",
+            "fouls drawn": "fouls_drawn", "fouls suffered": "fouls_drawn",
             "yellow cards": "yellow_cards",
             "corner kicks": "corner_kicks",
             "offsides": "offsides",
@@ -260,6 +266,16 @@ class SoccerAdapter(BaseSportAdapter):
                 return v
         return None
 
+    def _unsupported_market_reason(self, stat_display: str, player_name: str) -> str:
+        sd = (stat_display or "").lower()
+        if not player_name:
+            return "unsupported_team_market"
+        if any(token in sd for token in ["match result", "moneyline", "double chance", "both teams", "btts"]):
+            return "unsupported_binary_market"
+        if any(token in sd for token in ["team goals", "corners", "total goals"]):
+            return "unsupported_team_market"
+        return "stat_not_supported"
+
     async def enrich_props(self, props: list[dict]) -> list[dict]:
         await self._load_game_logs()
 
@@ -267,17 +283,26 @@ class SoccerAdapter(BaseSportAdapter):
         for prop in props:
             player_name = prop.get("player_name", "").strip()
             stat_display = prop.get("stat_display", prop.get("stat_type", ""))
+            prop["_sport_key"] = "soccer"
             stat_key = self._resolve_stat_key(stat_display)
             if not stat_key:
+                reason = self._unsupported_market_reason(stat_display, player_name)
+                prop["_projectionUnavailableReason"] = reason
+                prop["unavailableReason"] = reason
+                prop["unavailableCode"] = reason
                 continue
 
             extractor = self.STAT_EXTRACTORS.get(stat_key)
             if not extractor:
+                prop["_projectionUnavailableReason"] = "stat_not_supported"
+                prop["unavailableReason"] = "stat_not_supported"
+                prop["unavailableCode"] = "stat_not_supported"
                 continue
 
             # Try exact normalized match first, then fuzzy
             norm = player_name.lower().strip()
             game_log = self._player_game_log.get(norm)
+            match_confidence = 0.98 if game_log else None
 
             if not game_log:
                 # Try reversed order: "Raul Jimenez" → check "jimenez raul"
@@ -285,6 +310,8 @@ class SoccerAdapter(BaseSportAdapter):
                 if len(parts) >= 2:
                     reversed_norm = f"{parts[-1]} {' '.join(parts[:-1])}"
                     game_log = self._player_game_log.get(reversed_norm)
+                    if game_log:
+                        match_confidence = 0.9
 
             if not game_log:
                 # Last-name fuzzy fallback
@@ -292,9 +319,13 @@ class SoccerAdapter(BaseSportAdapter):
                 for key, log in self._player_game_log.items():
                     if last_name and last_name in key.split():
                         game_log = log
+                        match_confidence = 0.76
                         break
 
             if not game_log or len(game_log) < 1:
+                prop["_projectionUnavailableReason"] = "player_not_matched" if self._player_game_log else "provider_unavailable"
+                prop["unavailableReason"] = prop["_projectionUnavailableReason"]
+                prop["unavailableCode"] = prop["_projectionUnavailableReason"]
                 continue
 
             last5 = [extractor(g) for g in game_log[:5]]
@@ -319,7 +350,7 @@ class SoccerAdapter(BaseSportAdapter):
                 "oppShotsConcededL5": avg_opp_sot_conceded,
                 "lastOpponent": last_opponent,
             }
-            prop["_sport_key"] = "soccer"
+            prop["_playerMatchConfidence"] = match_confidence
             enriched += 1
 
         print(f"[Soccer] Enriched {enriched} of {len(props)} props")

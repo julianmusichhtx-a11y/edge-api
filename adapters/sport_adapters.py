@@ -132,6 +132,74 @@ class MMAAdapter(SportradarAdapter):
     }
 
 
+class TennisAdapter:
+    """
+    Honest Tennis adapter placeholder.
+
+    The frontend can request Tennis props, but this Railway deployment does not
+    have a tennis stat-history provider wired yet. Keep the contract stable by
+    returning every prop with explicit unavailable metadata instead of fake
+    projections or silent drops.
+    """
+    sport_key = "tennis"
+    sport_label = "Tennis"
+
+    SUPPORTED_STATS = set()
+    STAT_ALIASES = {
+        "aces": "aces",
+        "ace": "aces",
+        "double_faults": "double_faults",
+        "double faults": "double_faults",
+        "total_games": "total_games",
+        "total games": "total_games",
+        "games_won": "games_won",
+        "games won": "games_won",
+        "total_sets": "total_sets",
+        "total sets": "total_sets",
+        "sets_won": "sets_won",
+        "sets won": "sets_won",
+        "match_winner": "match_winner",
+        "match winner": "match_winner",
+        "set_winner": "set_winner",
+        "set winner": "set_winner",
+        "fantasy_points": "fantasy_points",
+        "fantasy points": "fantasy_points",
+        "break_points_won": "break_points_won",
+        "break points won": "break_points_won",
+        "break_points_saved": "break_points_saved",
+        "break points saved": "break_points_saved",
+        "first_serve_percentage": "first_serve_percentage",
+        "first serve percentage": "first_serve_percentage",
+        "first_serve_points_won": "first_serve_points_won",
+        "first serve points won": "first_serve_points_won",
+    }
+
+    def _normalize_stat(self, value: str) -> str:
+        stat = (value or "").strip().lower().replace("-", " ").replace("_", " ")
+        compact = stat.replace(" ", "_")
+        return self.STAT_ALIASES.get(compact) or self.STAT_ALIASES.get(stat) or compact
+
+    def enrich_props(self, props: list) -> list:
+        for prop in props:
+            raw_stat = prop.get("stat_display") or prop.get("stat_type") or ""
+            canonical = self._normalize_stat(raw_stat)
+            prop["_sport_key"] = self.sport_key
+            prop["canonicalStat"] = canonical
+            prop["rawStat"] = raw_stat
+            prop["_projectionSource"] = None
+            prop["_projectionUnavailableReason"] = "tennis_adapter_unavailable"
+            prop["unavailableReason"] = "tennis_adapter_unavailable"
+            prop["unavailableCode"] = "tennis_adapter_unavailable"
+            prop["_playerMatchConfidence"] = None
+        return props
+
+    def get_player_stats(self, player_name: str):
+        return None
+
+    def get_todays_games(self):
+        return []
+
+
 # Registry of all available adapters
 ADAPTER_REGISTRY = {
     "mlb": None,       # MLB uses its own adapter (MLBAdapter), not Sportradar
@@ -140,6 +208,8 @@ ADAPTER_REGISTRY = {
     "nfl": NFLAdapter,
     "nhl": NHLAdapter,
     "soccer": None,    # SoccerAdapter is in soccer_adapter.py (FIFA WC 2026 build)
+    "world_cup": None, # Routed to SoccerAdapter in adapters/__init__.py
+    "tennis": TennisAdapter,
     "mma": MMAAdapter,
 }
 

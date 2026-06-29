@@ -159,6 +159,7 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
             "projectionAvailable": False,
             "projectionUnavailableReason": reason,
             "unavailableReason": reason,
+            "unavailableCode": reason,
         }
 
     total_weight = sum(weight for weight, _ in buckets)
@@ -203,6 +204,7 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
         "hitRateL10": prop.get("hitRateL10"),
         "playerMatchConfidence": prop.get("_playerMatchConfidence"),
         "unavailableReason": None,
+        "unavailableCode": None,
         "projectionAvailable": True,
     }
 
@@ -210,10 +212,12 @@ def build_projection_metadata(prop: dict, scored: dict | None = None) -> dict:
 def _projection_failure_sample(prop: dict, reason: str) -> dict:
     return {
         "player": prop.get("player_name") or prop.get("player") or "",
+        "sport": (prop.get("_sport_key") or prop.get("sport") or "").upper(),
         "stat": prop.get("stat_display") or prop.get("stat_type") or "",
         "line": prop.get("line"),
         "side": prop.get("side") or prop.get("selectedSide") or "",
         "reason": reason,
+        "unavailableCode": reason,
     }
 
 
@@ -924,6 +928,16 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
             "no_game_logs": 0,
             "no_season_stats": 0,
             "no_stat_history": 0,
+            "insufficient_sample": 0,
+            "provider_unavailable": 0,
+            "provider_error": 0,
+            "invalid_line": 0,
+            "unsupported_market_type": 0,
+            "unsupported_team_market": 0,
+            "unsupported_match_market": 0,
+            "unsupported_binary_market": 0,
+            "tennis_adapter_unavailable": 0,
+            "sport_not_supported": 0,
             "projection_exception": 0,
         },
         "sampleFailures": [],
@@ -943,10 +957,11 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
                     "projectionAvailable": False,
                     "projectionUnavailableReason": "projection_exception",
                     "unavailableReason": "projection_exception",
+                    "unavailableCode": "projection_exception",
                 }
                 projection_health["errors"].append({"error": str(e)})
             _record_projection_health(projection_health, prop, projection)
-            passes.append({**prop, **projection, "verdict": "SKIP", "reason": "Insufficient data"})
+            passes.append({**prop, **projection, "verdict": "SKIP", "reason": projection.get("unavailableReason") or "Insufficient data"})
             continue
 
         try:
@@ -959,6 +974,7 @@ def score_props(props: list[dict], min_edge: float = 0.05) -> dict:
                 "projectionAvailable": False,
                 "projectionUnavailableReason": "projection_exception",
                 "unavailableReason": "projection_exception",
+                "unavailableCode": "projection_exception",
             }
             projection_health["errors"].append({"error": str(e)})
         _record_projection_health(projection_health, prop, projection)

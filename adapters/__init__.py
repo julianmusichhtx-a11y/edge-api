@@ -8,10 +8,11 @@ from .sport_adapters import (
     NHLAdapter,
     MMAAdapter,
     EsportsAdapter,
+    TennisAdapter,
 )
 
 def get_adapter(sport: str):
-    sport = sport.lower()
+    sport = (sport or "").lower()
     if sport == "mlb":
         return MLBAdapter()
     elif sport == "nba":
@@ -22,8 +23,10 @@ def get_adapter(sport: str):
         return NFLAdapter()
     elif sport == "nhl":
         return NHLAdapter()
-    elif sport == "soccer":
+    elif sport in ("soccer", "world_cup", "worldcup", "fifa_world_cup"):
         return SoccerAdapter()
+    elif sport in ("tennis", "tennis_atp", "tennis_wta", "atp", "wta"):
+        return TennisAdapter()
     elif sport == "mma":
         return MMAAdapter()
     elif sport in ("esports", "cs2", "lol", "league of legends", "valorant",
