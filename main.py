@@ -89,6 +89,10 @@ SUPPORTED_SPORTS = {
     },
 }
 
+# Only these public sports are enabled by the current product contract.
+# Keep other adapter code isolated until it is explicitly re-enabled.
+ENABLED_SPORT_KEYS = {"MLB", "SOCCER", "WORLD_CUP"}
+
 SPORT_ALIASES = {
     "mlb": "MLB",
     "baseball_mlb": "MLB",
@@ -118,7 +122,10 @@ def _normalize_sport_key(sport: str) -> str:
 
 def _sport_support(sport: str) -> dict:
     key = _normalize_sport_key(sport)
-    return SUPPORTED_SPORTS.get(key, {
+    if key in ENABLED_SPORT_KEYS:
+        return SUPPORTED_SPORTS.get(key, {})
+
+    return {
         "status": "unsupported",
         "projectionSupported": False,
         "predictionSupported": False,
@@ -126,8 +133,8 @@ def _sport_support(sport: str) -> dict:
         "unsupportedStats": [],
         "adapter": None,
         "notes": [],
-        "unsupportedReason": f"{sport or 'unknown'} is not supported by this backend contract",
-    })
+        "unsupportedReason": f"{sport or 'unknown'} is not enabled by this backend contract",
+    }
 
 
 def _default_projection_health(sport: str, props_received: int = 0, attempted: int = 0) -> dict:
@@ -232,7 +239,7 @@ app = FastAPI(title="EdgeLab Prediction API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -272,8 +279,8 @@ async def health():
         "backendVersion": BACKEND_VERSION,
         "predictionEnabled": True,
         "projectionEnabled": True,
-        "supportedSports": list(SUPPORTED_SPORTS.keys()),
-        "sportSupport": SUPPORTED_SPORTS,
+        "supportedSports": sorted(ENABLED_SPORT_KEYS),
+        "sportSupport": {key: SUPPORTED_SPORTS[key] for key in ENABLED_SPORT_KEYS},
         "configuredProviders": {
             "sportradar": bool(SPORTRADAR_API_KEY),
             "sportsDataIo": bool(SPORTSDATAIO_API_KEY),
@@ -291,7 +298,7 @@ async def health():
         },
         "projections": {
             "enabled": True,
-            "supportedSports": list(SUPPORTED_SPORTS.keys()),
+            "supportedSports": sorted(ENABLED_SPORT_KEYS),
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -302,8 +309,9 @@ async def health():
 async def predict(request: PredictRequest):
     try:
         normalized_sport = _normalize_sport_key(request.sport)
+        sport_support = _sport_support(request.sport)
         adapter = get_adapter(normalized_sport)
-        if not adapter:
+        if not sport_support.get("predictionSupported") or not adapter:
             projection_health = _default_projection_health(request.sport, len(request.props), 0)
             projection_health["enabled"] = False
             projection_health["unavailableReasons"]["sport_not_supported"] = len(request.props)
