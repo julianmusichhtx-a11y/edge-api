@@ -23,7 +23,7 @@ Calibration notes (June 2026):
 from __future__ import annotations
 
 import math
-from utils.odds_math import american_to_implied, classify_volatility, calculate_edge, devig_sharp_line, kelly_criterion, calculate_true_edge, kelly_criterion
+from utils.odds_math import american_to_implied, classify_volatility, calculate_edge, devig_sharp_line, kelly_criterion, calculate_true_edge
 
 
 def _safe_float(value) -> float | None:
