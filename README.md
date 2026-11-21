@@ -26,13 +26,13 @@ Test:
 curl -X POST http://localhost:8000/analyze \
   -H "Content-Type: application/json" \
   -d '{
+    "sport": "mlb",
     "props": [{
-      "player": "LeBron James",
-      "stat": "Points",
-      "line": 24.5,
-      "sport": "nba"
+      "player_name": "Aaron Judge",
+      "stat_display": "Hits",
+      "line": 1.5
     }],
-    "platform": "PrizePicks",
+    "platform": "underdog",
     "min_edge": 0.05
   }'
 ```
